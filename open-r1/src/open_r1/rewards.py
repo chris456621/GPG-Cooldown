@@ -7,8 +7,21 @@ import re
 from functools import partial, update_wrapper
 from typing import Callable, Dict
 
+import os
+
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
+
+if os.name != "posix":
+    # Windows 無 signal.SIGALRM，math_verify 預設每次 parse/verify 都 spawn 子進程會導致 WinError 6 且驗算恆為 0
+    import math_verify.grader as _mv_grader
+    import math_verify.parser as _mv_parser
+    import math_verify.utils as _mv_utils
+
+    _noop_timeout = lambda timeout_seconds=10: (lambda func: func)
+    _mv_utils.timeout = _noop_timeout
+    _mv_parser.timeout = _noop_timeout
+    _mv_grader.timeout = _noop_timeout
 
 from .utils import is_e2b_available
 from .utils.ioi import SubtaskResult, add_includes, get_piston_client_from_env, score_subtask

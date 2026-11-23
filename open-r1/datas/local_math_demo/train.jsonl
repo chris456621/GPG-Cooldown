@@ -1,0 +1,24 @@
+{"problem": "Compute 12 + 15. Put your final answer in \\boxed{}.", "solution": "$\\boxed{27}$"}
+{"problem": "Compute 9 * 8. Put your final answer in \\boxed{}.", "solution": "$\\boxed{72}$"}
+{"problem": "Compute 100 - 37. Put your final answer in \\boxed{}.", "solution": "$\\boxed{63}$"}
+{"problem": "Compute 144 / 12. Put your final answer in \\boxed{}.", "solution": "$\\boxed{12}$"}
+{"problem": "Solve for x: 2x + 6 = 14. Put your final answer in \\boxed{}.", "solution": "$\\boxed{4}$"}
+{"problem": "Compute 7^2 + 3. Put your final answer in \\boxed{}.", "solution": "$\\boxed{52}$"}
+{"problem": "What is 25% of 80? Put your final answer in \\boxed{}.", "solution": "$\\boxed{20}$"}
+{"problem": "Compute 15 * 4 - 10. Put your final answer in \\boxed{}.", "solution": "$\\boxed{50}$"}
+{"problem": "Solve for x: 3x - 5 = 16. Put your final answer in \\boxed{}.", "solution": "$\\boxed{7}$"}
+{"problem": "What is the area of a rectangle with length 9 and width 6? Put your final answer in \\boxed{}.", "solution": "$\\boxed{54}$"}
+{"problem": "Compute the sum of the first 10 positive integers. Put your final answer in \\boxed{}.", "solution": "$\\boxed{55}$"}
+{"problem": "If a train travels 60 km per hour for 3.5 hours, how many km does it travel? Put your final answer in \\boxed{}.", "solution": "$\\boxed{210}$"}
+{"problem": "Find the greatest common divisor of 48 and 180. Put your final answer in \\boxed{}.", "solution": "$\\boxed{12}$"}
+{"problem": "Solve for x: x^2 - 5x + 6 = 0, give the larger root. Put your final answer in \\boxed{}.", "solution": "$\\boxed{3}$"}
+{"problem": "What is the remainder when 2^10 is divided by 7? Put your final answer in \\boxed{}.", "solution": "$\\boxed{2}$"}
+{"problem": "How many ways can 5 distinct books be arranged on a shelf? Put your final answer in \\boxed{}.", "solution": "$\\boxed{120}$"}
+{"problem": "Find the sum of all prime numbers less than 20. Put your final answer in \\boxed{}.", "solution": "$\\boxed{77}$"}
+{"problem": "If 3a + 2b = 19 and a - b = 3, find a + b. Put your final answer in \\boxed{}.", "solution": "$\\boxed{7}$"}
+{"problem": "What is the 10th term of the arithmetic sequence 3, 7, 11, 15, ...? Put your final answer in \\boxed{}.", "solution": "$\\boxed{39}$"}
+{"problem": "Compute 17 * 23 - 13 * 19. Put your final answer in \\boxed{}.", "solution": "$\\boxed{144}$"}
+{"problem": "Find the number of positive divisors of 72. Put your final answer in \\boxed{}.", "solution": "$\\boxed{12}$"}
+{"problem": "A bag has 4 red balls and 6 blue balls. If 2 balls are drawn without replacement, what is the probability both are red? Express as a reduced fraction in \\boxed{}.", "solution": "$\\boxed{\\frac{2}{15}}$"}
+{"problem": "Find the sum of the digits of 2^15. Put your final answer in \\boxed{}.", "solution": "$\\boxed{26}$"}
+{"problem": "If f(x) = 2x^2 - 3x + 1, compute f(5) - f(2). Put your final answer in \\boxed{}.", "solution": "$\\boxed{33}$"}

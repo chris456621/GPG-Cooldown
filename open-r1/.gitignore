@@ -178,3 +178,12 @@ eval_results/
 results/
 
 .vscode/
+
+# Local venv & base models
+openr1_venv/
+models/
+
+# Ignore training checkpoints, keep summary reports
+outputs/*
+!outputs/comparison_report.md
+!outputs/comparison_report.json

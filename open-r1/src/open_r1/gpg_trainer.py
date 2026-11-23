@@ -91,80 +91,78 @@ class AdpativeRepeatRandomSampler(Sampler):
         self.trainer = trainer
 
     def __iter__(self):
-        if len(self.trainer.data_weight['train']) < 1 and len(self.trainer.data_weight['eval']) < 1:
-            # # E.g., [2, 4, 3, 1, 0, 6, 5] (num_samples = 7)
-            indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
-
-            #    [2, 4, 3, 1, 0, 6, 5]
-            # -> [[2, 4, 3], [1, 0, 6], [5]]  (batch_size = 3)
-            indexes = [indexes[i: i + self.batch_size] for i in range(0, len(indexes), self.batch_size)]
-
-            #    [[2, 4, 3], [1, 0, 6], [5]]
-            # -> [[2, 4, 3], [1, 0, 6]]
-            indexes = [chunk for chunk in indexes if len(chunk) == self.batch_size]
-        else:
-            def weight_soft(rewards):
-                if len(rewards) < 1:
-                    return 1.0
-                else:
-                    mean = sum(rewards) / len(rewards)
-                    if mean == 1.0:
-                        return 0.0
-                    elif mean == 0.0:
-                        return 0.0
-                    else:
-                        return 1.0 - mean
-
-            def weight_uniform(rewards):
+        def weight_soft(rewards):
+            if len(rewards) < 1:
                 return 1.0
-
-            def weight_hard(rewards):
-                # more hard problem to be solved
-                if len(rewards) < 1:
-                    return 1.0
-                else:
-                    mean = sum(rewards) / len(rewards)
-                    return 1 - mean
-
-            def weight_medium(rewards):
-                if len(rewards) < 1:
-                    return 1.0
-                else:
-                    mean = sum(rewards) / len(rewards)
-                    if mean == 0 or mean == 1:
-                        return 0
-                    else:
-                        return 1
-
-            strategy = {'uniform': weight_uniform, 'hard': weight_hard, 'soft': weight_soft, 'medium': weight_medium}
-            weight_cal = strategy[self.trainer.args.sample_strategy]
-            data_weight = self.trainer.data_weight['eval'] if len(self.trainer.data_weight['eval']) > 0 else self.trainer.data_weight['train']
-
-            # assert len(self.data_source[0]['problem']) == 1
-            if isinstance(self.data_source[0]["prompt"], (dict,)):
-                prompts = [self.data_source[i]["prompt"][-1]['content'] for i in range(self.num_samples)]
             else:
-                prompts = [self.data_source[i]["prompt"] for i in range(self.num_samples)]
+                # 僅取最近 3 次紀錄計算滑動平均，避免早期答錯拖慢權重更新
+                recent = rewards[-3:]
+                mean = sum(recent) / len(recent)
+                if mean == 1.0:
+                    return 0.0
+                elif mean == 0.0:
+                    # 給予 0.2 保底權重，避免難題或偶發全錯被永久封殺導致題型偏食
+                    return 0.2
+                else:
+                    return max(0.2, 1.0 - mean)
 
-            weights = [weight_cal(data_weight[prompt]) for prompt in prompts]
-            indexes = list(range(self.num_samples))
-            sampled_indexes = random.choices(indexes, weights=weights, k=self.num_samples)
+        def weight_uniform(rewards):
+            return 1.0
 
-            # 将采样后的索引分批
-            sampled_indexes = [sampled_indexes[i: i + self.batch_size] for i in
-                               range(0, len(sampled_indexes), self.batch_size)]
-            # 过滤不完整的批次
-            sampled_indexes = [chunk for chunk in sampled_indexes if len(chunk) == self.batch_size]
-            indexes = sampled_indexes
+        def weight_hard(rewards):
+            # more hard problem to be solved
+            if len(rewards) < 1:
+                return 1.0
+            else:
+                mean = sum(rewards) / len(rewards)
+                return 1 - mean
 
-            # 更新 data_weight：被选中的样本权重清空
-            for chunk in sampled_indexes:
-                for index in chunk:
-                    prompt = prompts[index]
-                    if len(data_weight[prompt]) > 0:
-                        del data_weight[prompt]  # 清空被选中的样本权重
+        def weight_medium(rewards):
+            if len(rewards) < 1:
+                return 1.0
+            else:
+                mean = sum(rewards) / len(rewards)
+                if mean == 0 or mean == 1:
+                    return 0
+                else:
+                    return 1
 
-        for chunk in indexes:
+        strategy = {'uniform': weight_uniform, 'hard': weight_hard, 'soft': weight_soft, 'medium': weight_medium}
+        weight_cal = strategy[self.trainer.args.sample_strategy]
+        data_weight = self.trainer.data_weight['eval'] if len(self.trainer.data_weight['eval']) > 0 else self.trainer.data_weight['train']
+
+        # 修正原本判斷 (dict,) 的 bug：make_conversation 產生的 prompt 是 list[dict]
+        if isinstance(self.data_source[0]["prompt"], (list,)):
+            prompts = [self.data_source[i]["prompt"][-1]['content'] for i in range(self.num_samples)]
+        else:
+            prompts = [self.data_source[i]["prompt"] for i in range(self.num_samples)]
+
+        # 逐 batch 動態抽題（第 1 個 epoch 起即生效），確保每個 global_step 都能即時套用最新冷卻狀態
+        num_batches = self.num_samples // self.batch_size
+        base_seed = self.seed if self.seed is not None else 0
+        rng = random.Random(base_seed + self.trainer.state.global_step)
+        all_indexes = list(range(self.num_samples))
+
+        for _ in range(num_batches):
+            current_step = self.trainer.state.global_step
+            weights = []
+            for prompt in prompts:
+                eligible_step = self.trainer.next_eligible_step[prompt]
+                if current_step < eligible_step:
+                    # 仍在冷卻期內（先前已全對），暫時不抽這題
+                    w = 0.0
+                elif eligible_step > 0:
+                    # 冷卻期滿，恢復權重讓模型回來複習，避免遺忘
+                    w = 1.0
+                else:
+                    w = weight_cal(data_weight[prompt])
+                weights.append(w)
+
+            # 防呆：若所有題目都在冷卻中或權重皆為 0，退回均勻抽樣避免 random.choices 報錯
+            if sum(weights) <= 0:
+                weights = [1.0] * self.num_samples
+
+            chunk = rng.choices(all_indexes, weights=weights, k=self.batch_size)
             for _ in range(self.repeat_count):
                 for index in chunk:
                     for _ in range(self.mini_repeat_count):
@@ -192,6 +190,10 @@ class GPGTrainer(GRPOTrainer):
                          optimizers,peft_config)
         self.scale_batch = args.scale_batch
         self.data_weight = {'train': defaultdict(list), 'eval': defaultdict(list)}
+        # 記錄每題下次可被抽樣的 global_step（預設 0 表示隨時可抽）
+        self.next_eligible_step = defaultdict(int)
+        # 全對（mean == 1.0）後的冷卻回合數，優先讀 args.cooldown_steps，預設 20
+        self.cooldown_steps = getattr(args, "cooldown_steps", 20)
 
     def _get_train_sampler(self) -> Sampler:
         # Returns a sampler that
@@ -413,9 +415,22 @@ class GPGTrainer(GRPOTrainer):
                         self.model_wrapped, self.accelerator,
                         gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
-                    prompt_completion_ids = unwrapped_model.generate(
-                        prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                    )
+                    # 生成階段暫時切到 eval() 並開啟 KV Cache，避免 gradient_checkpointing 鎖死 use_cache=False 導致 O(L^2) 重複計算
+                    was_training = unwrapped_model.training
+                    prev_use_cache = unwrapped_model.config.use_cache
+                    unwrapped_model.eval()
+                    unwrapped_model.config.use_cache = True
+                    try:
+                        prompt_completion_ids = unwrapped_model.generate(
+                            prompt_ids,
+                            attention_mask=prompt_mask,
+                            generation_config=self.generation_config,
+                            use_cache=True,
+                        )
+                    finally:
+                        unwrapped_model.config.use_cache = prev_use_cache
+                        if was_training:
+                            unwrapped_model.train()
 
                 # prompt_completion_ids = pad_sequence_to_length(prompt_completion_ids,
                 #                                                self.max_prompt_length+self.max_completion_length,
@@ -535,8 +550,17 @@ class GPGTrainer(GRPOTrainer):
 
             # calculate data weight based on acc reward
             mean_grouped_rewards_cpu = mean_grouped_rewards.cpu().numpy()
+            current_step = self.state.global_step
             for i, p in enumerate(ordered_set_of_problems):
-                self.data_weight[mode][p].append(float(mean_grouped_rewards_cpu[i]))
+                score = float(mean_grouped_rewards_cpu[i])
+                self.data_weight[mode][p].append(score)
+                if mode == "train":
+                    if score >= 1.0:
+                        # 該題全對：設定冷卻期，cooldown_steps 回合後再回來複習
+                        self.next_eligible_step[p] = current_step + self.cooldown_steps
+                    else:
+                        # 未全對：立即解除冷卻，維持正常抽樣
+                        self.next_eligible_step[p] = 0
 
             stds = rewards.view(-1, self.num_generations).std(dim=1)
             # 找出标准差为 0 的组
@@ -716,9 +740,13 @@ class GPGTrainer(GRPOTrainer):
         run_dir = self._get_output_dir(trial=trial)
         output_dir = os.path.join(run_dir, checkpoint_folder)
         file_path = os.path.join(output_dir, 'data_weight.json')
+        eligible_path = os.path.join(output_dir, 'next_eligible_step.json')
         if self.accelerator.is_main_process:
             with open(file_path, "w", encoding="utf-8") as file:
                 json.dump(dict(self.data_weight), file, ensure_ascii=False, indent=4)
+            # 同步保存每題的冷卻解鎖 step，方便後續檢查或續訓
+            with open(eligible_path, "w", encoding="utf-8") as file:
+                json.dump(dict(self.next_eligible_step), file, ensure_ascii=False, indent=4)
             print(f"data_weight 已成功保存到 {file_path}")
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:

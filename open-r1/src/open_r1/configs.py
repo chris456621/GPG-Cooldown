@@ -63,7 +63,11 @@ class GPGConfig(GRPOConfig):
     adjust_gd: bool = field(default=False, metadata={"help": "adjust gd  based on the valid sample within a batch."})
     sample_strategy: Optional[str] = field(
         default="uniform",
-        metadata={"help": ("hard, uniform.")},
+        metadata={"help": ("hard, uniform, soft, medium.")},
+    )
+    cooldown_steps: int = field(
+        default=20,
+        metadata={"help": "全對後冷卻的回合數（global_step），期滿後才重新抽樣複習"},
     )
     min_inverse_alpha: float = field(default=0.5, metadata={"help": "minimum inverse alpha"})
 
