@@ -1,0 +1,3 @@
+python-interpreter-path = "openr1_venv/Scripts/python.exe"
+search-path = ["src", "scripts"]
+python-version = "3.11"

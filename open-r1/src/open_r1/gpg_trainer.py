@@ -153,7 +153,7 @@ class AdpativeRepeatRandomSampler(Sampler):
                     w = 0.0
                 elif eligible_step > 0:
                     # 冷卻期滿，恢復權重讓模型回來複習，避免遺忘
-                    w = 1.0
+                    w = 0.2 
                 else:
                     w = weight_cal(data_weight[prompt])
                 weights.append(w)
@@ -192,8 +192,23 @@ class GPGTrainer(GRPOTrainer):
         self.data_weight = {'train': defaultdict(list), 'eval': defaultdict(list)}
         # 記錄每題下次可被抽樣的 global_step（預設 0 表示隨時可抽）
         self.next_eligible_step = defaultdict(int)
+        # 記錄每題連續全對次數，供指數退避冷卻計算
+        self.consecutive_mastered = defaultdict(int)
         # 全對（mean == 1.0）後的冷卻回合數，優先讀 args.cooldown_steps，預設 20
         self.cooldown_steps = getattr(args, "cooldown_steps", 20)
+        self.cooldown_backoff = bool(getattr(args, "cooldown_backoff", False))
+        self.cooldown_backoff_factor = float(getattr(args, "cooldown_backoff_factor", 2.0))
+        self.cooldown_max_steps = int(getattr(args, "cooldown_max_steps", 0))
+
+    def _compute_cooldown_delay(self, consecutive_hits: int) -> int:
+        """計算題目全對後的冷卻步數（支援線性固定或指數退避與上限封頂）。"""
+        if self.cooldown_backoff:
+            delay = int(round(self.cooldown_steps * (self.cooldown_backoff_factor ** max(0, consecutive_hits - 1))))
+        else:
+            delay = int(self.cooldown_steps)
+        if self.cooldown_max_steps > 0:
+            delay = min(delay, self.cooldown_max_steps)
+        return max(0, delay)
 
     def _get_train_sampler(self) -> Sampler:
         # Returns a sampler that
@@ -556,10 +571,13 @@ class GPGTrainer(GRPOTrainer):
                 self.data_weight[mode][p].append(score)
                 if mode == "train":
                     if score >= 1.0:
-                        # 該題全對：設定冷卻期，cooldown_steps 回合後再回來複習
-                        self.next_eligible_step[p] = current_step + self.cooldown_steps
+                        # 該題全對：依連續全對次數計算冷卻步數（線性或指數退避）
+                        self.consecutive_mastered[p] += 1
+                        delay = self._compute_cooldown_delay(self.consecutive_mastered[p])
+                        self.next_eligible_step[p] = current_step + delay
                     else:
-                        # 未全對：立即解除冷卻，維持正常抽樣
+                        # 未全對：重置連續全對次數並立即解除冷卻
+                        self.consecutive_mastered[p] = 0
                         self.next_eligible_step[p] = 0
 
             stds = rewards.view(-1, self.num_generations).std(dim=1)
@@ -741,12 +759,15 @@ class GPGTrainer(GRPOTrainer):
         output_dir = os.path.join(run_dir, checkpoint_folder)
         file_path = os.path.join(output_dir, 'data_weight.json')
         eligible_path = os.path.join(output_dir, 'next_eligible_step.json')
+        mastered_path = os.path.join(output_dir, 'consecutive_mastered.json')
         if self.accelerator.is_main_process:
             with open(file_path, "w", encoding="utf-8") as file:
                 json.dump(dict(self.data_weight), file, ensure_ascii=False, indent=4)
-            # 同步保存每題的冷卻解鎖 step，方便後續檢查或續訓
+            # 同步保存每題的冷卻解鎖 step 與連續全對次數，方便後續檢查或續訓
             with open(eligible_path, "w", encoding="utf-8") as file:
                 json.dump(dict(self.next_eligible_step), file, ensure_ascii=False, indent=4)
+            with open(mastered_path, "w", encoding="utf-8") as file:
+                json.dump(dict(self.consecutive_mastered), file, ensure_ascii=False, indent=4)
             print(f"data_weight 已成功保存到 {file_path}")
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:

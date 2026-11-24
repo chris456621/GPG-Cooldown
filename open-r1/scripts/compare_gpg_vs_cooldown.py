@@ -25,7 +25,7 @@ from typing import Any
 import torch
 import yaml
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT / "src"
@@ -188,20 +188,22 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def _format_chat_prompt(tokenizer: AutoTokenizer, system_prompt: str | None, problem: str) -> str:
+def _format_chat_prompt(tokenizer: PreTrainedTokenizerBase, system_prompt: str | None, problem: str) -> str:
     messages: list[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": problem})
     try:
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return str(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
     except Exception:
         # 部分模型不支援 system role，改將 system prompt 併入 user prompt
         merged = f"{system_prompt}\n\n{problem}" if system_prompt else problem
-        return tokenizer.apply_chat_template(
-            [{"role": "user", "content": merged}],
-            tokenize=False,
-            add_generation_prompt=True,
+        return str(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": merged}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         )
 
 
@@ -232,12 +234,17 @@ def evaluate_model(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    hw_det = resolved["hardware_detected"]
+    backend = hw_det.get("accelerator_backend") or ("cuda" if torch.cuda.is_available() else "cpu")
+
     load_kwargs: dict[str, Any] = {
         "torch_dtype": torch_dtype,
         "attn_implementation": hw_res["attn_implementation"],
-        "device_map": "auto",
         "trust_remote_code": trust_remote_code,
     }
+    if backend == "cuda":
+        load_kwargs["device_map"] = "auto"
+
     quant_cfg = model_cfg.get("quantization", {}) or {}
     if quant_cfg.get("load_in_4bit"):
         from transformers import BitsAndBytesConfig
@@ -250,6 +257,8 @@ def evaluate_model(
         )
 
     model = AutoModelForCausalLM.from_pretrained(str(model_source), **load_kwargs)
+    if backend == "mps":
+        model = model.to("mps")
     if adapter_dir is not None:
         model = PeftModel.from_pretrained(model, str(adapter_dir))
     model.eval()
@@ -279,6 +288,8 @@ def evaluate_model(
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    elif getattr(torch, "mps", None) is not None and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
     return {
         "correct": correct,
@@ -308,15 +319,16 @@ def render_comparison_report_md(
     decode_mode = "Sampling" if ev["do_sample"] else "Greedy Decoding"
     max_steps = int(tr["max_steps"])
     cuda_ver = hw.get("cuda_version") or "N/A"
+    backend = hw.get("accelerator_backend") or ("cuda" if hw.get("cuda_available") else ("mps" if hw.get("mps_available") else "cpu"))
     effective_yaml = yaml.safe_dump(resolved["effective_config"], allow_unicode=True, sort_keys=False).rstrip()
 
     lines = [
         f"# GPG 原版 vs. 改良版 對照報告（Train {train_count} / Eval {eval_count} / G={tr['num_generations']} / {max_steps} Steps）",
         "",
         f"1. **基礎模型**：`{model_display}`（`name_or_path={model_cfg['name_or_path']}`, `hf_repo_id={model_cfg.get('hf_repo_id')}` | `dtype={hr['torch_dtype']}` (`bf16={hr['bf16']}`, `fp16={hr['fp16']}`), `attn={hr['attn_implementation']}` | LoRA: `enabled={lora['enabled']}`, `r={lora['r']}`, `alpha={lora['alpha']}`, `dropout={lora['dropout']}`, `target_modules={lora['target_modules']}` | 4-bit: `load_in_4bit={quant['load_in_4bit']}`）",
-        f"2. **硬體與環境**：GPU=`{hw['gpu_name']}` | VRAM=`{hw['total_vram_gb']} GB` (free `{hw['free_vram_gb']} GB`), `CC={hw['compute_capability']}`, `profile={hr['profile']}` | OS=`{hw['os']} {hw['os_release']}` | Python=`{hw['python_version']}` | PyTorch=`{hw['torch_version']}` (CUDA `{cuda_ver}`) | Config SHA256=`{resolved['config_sha256'][:12]}`",
+        f"2. **硬體與環境**：GPU=`{hw['gpu_name']}` | backend=`{backend}` | VRAM=`{hw['total_vram_gb']} GB` (free `{hw['free_vram_gb']} GB`), `CC={hw['compute_capability']}`, `profile={hr['profile']}` | OS=`{hw['os']} {hw['os_release']}` | Python=`{hw['python_version']}` | PyTorch=`{hw['torch_version']}` (CUDA `{cuda_ver}`) | Config SHA256=`{resolved['config_sha256'][:12]}`",
         f"3. **評測方式**：{decode_mode}（`do_sample={ev['do_sample']}`, `max_new_tokens={ev['max_new_tokens']}`, `batch_size={ev['batch_size']}`）",
-        f"4. **重要參數**：`Train={train_count}` / `Eval={eval_count}` / `G={tr['num_generations']}` / `Steps={max_steps}` | `L={tr['max_completion_length']}`, `max_prompt_length={tr['max_prompt_length']}`, `per_device_train_batch_size={tr['per_device_train_batch_size']}`, `gradient_accumulation_steps={tr['gradient_accumulation_steps']}`, `learning_rate={tr['learning_rate']}`, `lr_scheduler_type={tr['lr_scheduler_type']}`, `warmup_ratio={tr['warmup_ratio']}`, `cooldown_steps={gpg['cooldown_steps']}`, `sample_strategy={gpg['sample_strategy']}`, `scale_rewards={gpg['scale_rewards']}`, `min_inverse_alpha={gpg['min_inverse_alpha']}`, `seed={tr['seed']}`",
+        f"4. **重要參數**：`Train={train_count}` / `Eval={eval_count}` / `G={tr['num_generations']}` / `Steps={max_steps}` | `L={tr['max_completion_length']}`, `max_prompt_length={tr['max_prompt_length']}`, `per_device_train_batch_size={tr['per_device_train_batch_size']}`, `gradient_accumulation_steps={tr['gradient_accumulation_steps']}`, `learning_rate={tr['learning_rate']}`, `lr_scheduler_type={tr['lr_scheduler_type']}`, `warmup_ratio={tr['warmup_ratio']}`, `cooldown_steps={gpg['cooldown_steps']}`, `cooldown_backoff={gpg.get('cooldown_backoff', False)}`, `cooldown_backoff_factor={gpg.get('cooldown_backoff_factor', 2.0)}`, `cooldown_max_steps={gpg.get('cooldown_max_steps', 0)}`, `sample_strategy={gpg['sample_strategy']}`, `scale_rewards={gpg['scale_rewards']}`, `min_inverse_alpha={gpg['min_inverse_alpha']}`, `seed={tr['seed']}`",
         "",
         "## 1. 訓練過程指標比較",
         "",
@@ -356,16 +368,49 @@ def render_comparison_report_md(
     return "\n".join(lines) + "\n"
 
 
+def _parse_bool_flag(raw: str) -> bool:
+    low = raw.strip().lower()
+    if low in ("true", "1", "yes", "y"):
+        return True
+    if low in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"無效的布林值: {raw!r}（請輸入 true 或 false）")
+
+
 def _build_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     if args.model_name_or_path:
         overrides.setdefault("model", {})["name_or_path"] = args.model_name_or_path
+    if args.hf_repo_id:
+        overrides.setdefault("model", {})["hf_repo_id"] = args.hf_repo_id
     if args.run_tag:
         overrides.setdefault("experiments", {})["run_tag"] = args.run_tag
     if args.max_steps is not None:
         overrides.setdefault("training", {})["max_steps"] = args.max_steps
+    if args.num_generations is not None:
+        overrides.setdefault("training", {})["num_generations"] = args.num_generations
+        if args.per_device_train_batch_size is None:
+            overrides.setdefault("training", {})["per_device_train_batch_size"] = args.num_generations
+    if args.per_device_train_batch_size is not None:
+        overrides.setdefault("training", {})["per_device_train_batch_size"] = args.per_device_train_batch_size
+    if args.gradient_accumulation_steps is not None:
+        overrides.setdefault("training", {})["gradient_accumulation_steps"] = args.gradient_accumulation_steps
+    if args.max_completion_length is not None:
+        overrides.setdefault("training", {})["max_completion_length"] = args.max_completion_length
+    if args.seed is not None:
+        overrides.setdefault("training", {})["seed"] = args.seed
+    if args.grad_ckpt is not None:
+        overrides.setdefault("training", {})["gradient_checkpointing"] = args.grad_ckpt
+    if args.sample_strategy:
+        overrides.setdefault("gpg", {})["sample_strategy"] = args.sample_strategy
     if args.cooldown_steps is not None:
         overrides.setdefault("gpg", {})["cooldown_steps"] = args.cooldown_steps
+    if args.cooldown_backoff is not None:
+        overrides.setdefault("gpg", {})["cooldown_backoff"] = args.cooldown_backoff
+    if args.cooldown_backoff_factor is not None:
+        overrides.setdefault("gpg", {})["cooldown_backoff_factor"] = args.cooldown_backoff_factor
+    if args.cooldown_max_steps is not None:
+        overrides.setdefault("gpg", {})["cooldown_max_steps"] = args.cooldown_max_steps
     if args.precision:
         overrides.setdefault("hardware", {})["precision"] = args.precision
     if args.gpu_profile:
@@ -377,10 +422,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="由 experiment_config.yaml 驅動的 GPG vs Cooldown 對照實驗")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH), help="集中設定檔路徑")
     parser.add_argument("--model_name_or_path", type=str, default=None, help="覆蓋基礎模型路徑或 HF repo id")
+    parser.add_argument("--hf_repo_id", type=str, default=None, help="覆蓋 model.hf_repo_id（搭配 --auto_download）")
     parser.add_argument("--run_tag", type=str, default=None, help="覆蓋 experiments.run_tag（避免覆蓋舊實驗）")
     parser.add_argument("--max_steps", type=int, default=None, help="覆蓋每組訓練總步數")
+    parser.add_argument("--num_generations", type=int, default=None, help="覆蓋 G (training.num_generations)")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=None, help="覆蓋 training.per_device_train_batch_size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="覆蓋 training.gradient_accumulation_steps")
+    parser.add_argument("--max_completion_length", type=int, default=None, help="覆蓋 L (training.max_completion_length)")
+    parser.add_argument("--seed", type=int, default=None, help="覆蓋 training.seed")
+    parser.add_argument("--grad_ckpt", type=_parse_bool_flag, default=None, help="覆蓋 gradient_checkpointing (true/false)")
+    parser.add_argument("--sample_strategy", type=str, default=None, help="覆蓋 gpg.sample_strategy (uniform/soft/hard/medium)")
     parser.add_argument("--cooldown_steps", type=int, default=None, help="覆蓋全對後冷卻步數")
+    parser.add_argument("--cooldown_backoff", type=_parse_bool_flag, default=None, help="是否啟用冷卻指數退避 (true/false)")
+    parser.add_argument("--cooldown_backoff_factor", type=float, default=None, help="覆蓋指數退避倍數（預設 2.0）")
+    parser.add_argument("--cooldown_max_steps", type=int, default=None, help="覆蓋指數退避上限步數（0=無上限）")
     parser.add_argument("--include_safesoft", action="store_true", help="額外啟用 Safe-Soft + Cooldown 組")
+    parser.add_argument("--only_cooldown", action="store_true", help="跳過 baseline_gpg，只跑 Cooldown 實驗組")
+    parser.add_argument("--skip_base_eval", action="store_true", help="評測時跳過 Base 模型（節省時間）")
     parser.add_argument("--precision", type=str, default=None, help="覆蓋 hardware.precision (auto/bf16/fp16/fp32)")
     parser.add_argument("--gpu_profile", type=str, default=None, help="覆蓋 hardware.gpu_profile")
     parser.add_argument("--strict_env", action="store_true", help="套件或 Python/PyTorch 版本不符時直接中止")
@@ -397,7 +455,11 @@ def main() -> None:
     )
     print_status_report(resolved)
 
-    groups = resolve_experiment_groups(resolved, include_safesoft=args.include_safesoft)
+    groups = resolve_experiment_groups(
+        resolved,
+        include_safesoft=args.include_safesoft,
+        only_cooldown=args.only_cooldown,
+    )
     if not groups:
         raise RuntimeError("experiments.groups 沒有任何啟用的實驗組別。")
 
@@ -419,9 +481,10 @@ def main() -> None:
                 f"  - [{grp['slug']}] {grp['label']}\n"
                 f"      output_dir={grp['output_dir']} | max_steps={trl_preview['max_steps']} "
                 f"| G={trl_preview['num_generations']} | bs={trl_preview['per_device_train_batch_size']} "
-                f"| L={trl_preview['max_completion_length']} | dtype={trl_preview['torch_dtype']} "
+                f"| L={trl_preview['max_completion_length']} | seed={trl_preview['seed']} | dtype={trl_preview['torch_dtype']} "
                 f"| weighted={trl_preview['weighted_sample']} | strategy={trl_preview['sample_strategy']} "
-                f"| cooldown={trl_preview['cooldown_steps']}"
+                f"| cooldown={trl_preview['cooldown_steps']} | backoff={trl_preview['cooldown_backoff']} "
+                f"(factor={trl_preview['cooldown_backoff_factor']}, max={trl_preview['cooldown_max_steps']})"
             )
         return
 
@@ -445,9 +508,10 @@ def main() -> None:
     train_logs = {grp["label"]: parse_train_logs(grp["output_dir"]) for grp in groups}
 
     model_display = Path(str(resolved["model"]["name_or_path"])).name
-    eval_targets: list[tuple[str, Path | None]] = [(f"Base ({model_display})", None)] + [
-        (grp["label"], grp["output_dir"]) for grp in groups
-    ]
+    eval_targets: list[tuple[str, Path | None]] = []
+    if not args.skip_base_eval:
+        eval_targets.append((f"Base ({model_display})", None))
+    eval_targets.extend((grp["label"], grp["output_dir"]) for grp in groups)
     eval_results = {}
     for label, adapter in eval_targets:
         eval_results[label] = {

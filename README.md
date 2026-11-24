@@ -1,172 +1,231 @@
-<div align="center">
-<h1 align="center">
-  <a href="https://openreview.net/forum?id=inccdtfx8x">[ICLR2026]</a> GPG: A Simple and Strong Reinforcement Learning Baseline for Model Reasoning
-</h1>
-  <div align="center">
-        <div class="is-size-5 publication-authors">
-              <span class="author-block"> <a href="https://scholar.google.com/citations?user=jn21pUsAAAAJ" target="_blank">Xiangxiang Chu</a>, </span>
-              <span class="author-block"> <a href="https://scholar.google.com/citations?user=X0o0Ib8AAAAJ" target="_blank">Hailang Huang</a>, </span>
-              <span class="author-block"><a href="https://github.com/undyingjoker" target="_blank">Xiao Zhang</a>, </span>
-              <span class="author-block"><a href="https://scholar.google.com/citations?user=xqrPe6gAAAAJ" target="_blank">Fei Wei</a>, </span>
-              <span class="author-block"> <a href="https://www.semanticscholar.org/author/Yong-Wang/1683878" target="_blank">Yong Wang</a></span>
-        </div>
-        <div class="is-size-5 publication-authors">
-              <span class="author-block">AMAP, Alibaba Group</span>
-        </div>
-    </div>
+# GPG + Cooldown 團隊開發與訓練指南
 
-[//]: # (   📖<a href="https://arxiv.org/abs/2504.02546">Paper <img src="http://img.shields.io/badge/cs.LG-arXiv%3A2504.02546-B31B1B.svg?link=https%3A%2F%2Farxiv.org%2Fabs%2F2504.02546"></a> .)
-</div>
+本文件說明本分支相較於官方 [`AMAP-ML/GPG`](https://github.com/AMAP-ML/GPG) 的程式改動、Windows / RTX 4060 8GB 環境建置、訓練與對照實驗啟動方式，以及超參數調整細節。
 
-## 🎉 Congratulations
+---
 
-GPG has been accepted to ICLR 2026 and is supported by the famous VERL RL framework: https://verl.readthedocs.io/en/latest/algo/gpg.html
+## 1. 專案概述與核心改動
 
-<div>
-Reinforcement Learning (RL) can directly enhance the reasoning capabilities of large language models without extensive reliance on Supervised Fine-Tuning (SFT). In this work, we revisit the traditional Policy Gradient (PG) mechanism and propose a minimalist RL approach termed Group Policy Gradient (GPG). Unlike conventional methods, GPG directly optimize the original RL objective, thus obviating the need for surrogate loss functions. By eliminating the critic and reference models, avoiding KL divergence constraints, and addressing the advantage and gradient estimation bias, our approach significantly simplifies the training process compared to Group Relative Policy Optimization (GRPO). Our approach achieves superior performance without relying on auxiliary techniques or adjustments. As illustrated in the figure below, extensive experiments demonstrate that our method not only reduces computational costs but also consistently outperforms GRPO across various unimodal and multimodal tasks.
-    <img src="docs/images/figure0.svg?_t=202504301741" alt="GPG" width="100%">
-</div>
+![GPG vs Cooldown Architecture](open-r1/assets/gpg_vs_cooldown_architecture.png)
 
+針對本地單卡 8GB VRAM 環境與動態題目抽樣機制，主要修改了 `open-r1/src/open_r1/` 底下的三個檔案並新增本地實驗腳本：
 
-<div align="center">
-<h3>Comparison of various RL methods</h2>
-<img src="docs/images/GPG.png?_t=202505061400" alt="GPG-method" width="100%">
-</div>
+1. **`open-r1/src/open_r1/configs.py`**
+   - 於 `GPGConfig` 新增 `cooldown_steps: int = 20`（某題在群組 rollouts 中全對後，冷卻多少個 `global_step` 才重新加入抽樣池複習）。
+   - `sample_strategy` 的說明補齊支援選項：`hard`、`uniform`、`soft`、`medium`。
 
-------
+2. **`open-r1/src/open_r1/gpg_trainer.py`**
+   - **逐 batch 動態抽樣與冷卻機制（`AdpativeRepeatRandomSampler`）**：從第 1 個 epoch 起即改為逐 batch 依 `global_step` 動態計算抽樣權重（`rng = random.Random(base_seed + global_step)`）。在 `compute_loss` / reward 記錄階段，若題目平均分數 `score >= 1.0`（該題 rollouts 全對），將 `next_eligible_step[p]` 設為 `current_step + cooldown_steps`；未全對則重設為 `0` 立即恢復抽樣。若所有題目皆處於冷卻或權重為 0，會自動退回均勻抽樣防止 `random.choices` 報錯。
+   - **修正 `prompt` 型別判斷 bug**：`make_conversation` 產生的 `prompt` 為 `list[dict]`，原版誤判為 `(dict,)`，已修正為 `isinstance(..., (list,))`。
+   - **改良 `weight_soft`（Safe-Soft）**：僅取最近 3 次紀錄（`rewards[-3:]`）計算滑動平均，且對全錯或低分題保留 `0.2` 保底權重（`max(0.2, 1.0 - mean)`），避免難題被永久封殺導致題型偏食。
+   - **生成階段啟用 KV Cache**：於 `unwrapped_model.generate(...)` 期間暫時切換至 `.eval()` 並設定 `use_cache=True`，避免 `gradient_checkpointing` 鎖死 `use_cache=False` 造成 $O(L^2)$ 重複計算，生成結束後再透過 `finally` 還原狀態。
+   - **Checkpoint 額外狀態保存**：儲存模型 checkpoint 時，同步寫出 `next_eligible_step.json`（與 `data_weight.json` 同層），方便檢查冷卻狀態或續訓。
 
-# Resources
+3. **`open-r1/src/open_r1/rewards.py`**
+   - **Windows `math_verify` Patch**：Windows 沒有 `signal.SIGALRM`，`math_verify` 預設每次 `parse`/`verify` 會 spawn 子進程導致 `WinError 6` 且驗算恆為 `0`。在非 POSIX 系統上自動將 `math_verify` 的 `timeout` 替換為 no-op，確保數學答案批改正常運作。
 
-## 🤗 Models
+4. **新增實驗與輔助檔案**
+   - `open-r1/experiment_config.yaml`：**唯一集中設定檔（Single Source of Truth）**，統一管理 Windows 11 套件版本、CUDA GPU 自動相容規則、模型/LoRA/量化、資料集、訓練排程、GPG Cooldown 與對照實驗組別。
+   - `open-r1/src/open_r1/experiment_config.py`：設定解析、Windows 11 套件檢查與不同 CUDA GPU 自動偵測/適配模組。
+   - `open-r1/scripts/setup_win11.ps1`：Windows 11 一鍵建置 `openr1_venv` 與套件同步腳本。
+   - `open-r1/recipes/local_rtx4060_gpg_cooldown.yaml`：單卡 RTX 4060 8GB 舊版平坦設定檔（仍保留向後相容）。
+   - `open-r1/scripts/compare_gpg_vs_cooldown.py`：由 `experiment_config.yaml` 驅動的一鍵對照實驗腳本（支援 `--dry_run`、`--auto_download`、`--model_name_or_path`、`--run_tag`），並於報表自動寫入硬體與套件環境指紋。
+   - `open-r1/scripts/generate_math_dataset.py`：確定性數學題庫生成器（10 大題型、嚴格零重疊，Train 200 題 + Eval 100 題），已預先生成並附在 `open-r1/datas/math_200/train.jsonl` 與 `open-r1/datas/eval_100.jsonl`。
 
-1. [GPG-Open-RS1](https://huggingface.co/GD-ML/Open-RS1): The RL model trained on the Open-r1 dataset based on GPG, using DeepSeek-R1-Distill-Qwen-1.5B as the baseline model.
-2. [GPG-7B](https://huggingface.co/GD-ML/Qwen2.5-Math-7B-GPG): The RL model trained on the simplelr_qwen_level3to5 dataset based on GPG, using Qwen2.5-Math-7B as the baseline model.
+---
 
-# Usage
+## 2. 環境建置（Windows 11 / 跨 CUDA GPU 實測版本）
 
-## Environment Installation
+本機實際測試通過的套件版本集中鎖定在 **`open-r1/experiment_config.yaml`** 的 `environment` 區段（`openr1_venv/` 與 `models/` 已被 `.gitignore` 排除，clone 後需建立）：
 
-Clone this repository.
+### 方法 A（推薦）：Windows 11 一鍵建置與驗證
 
-```bash
-git clone git@github.com:AMAP-ML/GPG.git
-
-cd GPG
-```
-Follow the repositories you need and install the required packages.
-
-## Experiments on unimodal tasks
-
-Please refer to the training script: [`./open-rs/train.sh`](./open-rs/train.sh), [`./open-rs/recipes`](./open-rs/recipes)
-
-The results are as follows:
-
-> Table: The zero-shot pass@1 performance of the 1.5B models distilled by DeepSeek-R1 across five mathematical reasoning benchmarks. $\dagger$: reproduced results using the released code. $\ddagger$: results from open-rs.
-> | Distilled 1.5B Models             | Average       | AIME24           | MATH-500      | AMC23 | Minerva | OlympiadBench |
-> |-----------------------------------|:-------------:|:----------------:|:-------------:|:-----:|:-------:|:-------------:|
-> | DeepSeek-R1-Distill-Qwen-1.5B     | 48.9          | 28.8             | 82.8          | 62.9  | 26.5    | 43.3          |
-> | Still-3-1.5B-Preview              | 51.6          | 32.5             | 84.4          | 66.7  | 29.0    | 45.4          |
-> | Open-RS1 $^\dagger$               | 53.1          | 33.3             | 83.8          | 67.5  | 29.8    | 50.9          |
-> | Open-RS3 $^\dagger$               | 52.0          | 26.7             | 85.4          | 70.0  | 27.9    | 50.2          |
-> | GPG-RS1                           | 55.7          | 33.3             | 87.6          | 77.5  | 29.4    | 50.5          |
-> | GPG-RS3                           | 55.5          | 33.3             | 85.0          | 80.0  | 26.8    | 52.4          |
-
-Please refer to the training script: [`./open-r1/train.sh`](./open-r1/train.sh)
-
-> Table: The zero-shot pass@1 performance of the 7B models across five mathematical reasoning benchmarks. $\dagger$: reproduced results using the released code. $\ddagger$: results from open-rs. $^\star$: results from Dr.GRPO.
-> | 7B Models                                      | Average     | AIME24 | MATH-500 | AMC23         | Minerva | OlympiadBench |
-> |------------------------------------------------|:-----------:|:------:|:--------:|:-------------:|:-------:|:-------------:|
-> | Qwen-2.5-Math-7B-Instruct $^\ddagger$          | 43.8        | 13.3   | 79.8     | 50.6          | 34.6    | 40.7          |
-> | Qwen2.5-Math-7B                                | 30.9        | 13.3   | 57.6     | 45.0          | 14.7    | 23.7          |
-> | Qwen2.5-Math-7B (no template) $^\star$         | 38.2        | 0.2    | 69.0     | 45.8          | 21.3    | 34.7          |
-> | rStar-Math-7B                                  | -           | 26.7   | 78.4     | 47.5          | -       | 47.1          |
-> | Eurus-2-7B-PRIME                               | 48.9        | 26.7   | 79.2     | 57.8          | 38.6    | 42.1          |
-> | Oat-Zero-7B                                    | 51.4        | 43.3   | 80.0     | 62.7          | 30.1    | 41.0          |
-> | Oat-Zero-7B $^\dagger$                         | 47.8        | 30.0   | 80.6     | 55.4          | 29.0    | 44.0          |
-> | OpenReasoner-Zero-7B @ 8k                      | 45.9        | 13.3   | 82.4     | 54.2          | 31.6    | 47.9          |
-> | SimpleRL-Zero-7B $^\star$                      | 46.6        | 26.7   | 78.2     | 60.2          | 27.6    | 40.3          |
-> | GPG-7B                                         | 57.7        | 36.7   | 84.6     | 82.5          | 39.0    | 45.8          |
-
-
-> Table: Math reasoning results on Qwen2.5-Math-7B model. $\dagger$: reproduction use the released code.
-> | Models                                                       | Average   | AIME24    | MATH-500  | AMC23 | Minerva   | OlympiadBench |
-> |--------------------------------------------------------------|:---------:|:---------:|:---------:|:-----:|:---------:|:-------------:|
-> | Qwen2.5-Math-7B                                              | 30.9      | 13.3      | 57.6      | 45.0  | 14.7      | 23.7          |
-> | GPRO                                                         | 43.7      | 16.7      | 73.4      | 62.5  | 30.2      | 35.7          |
-> | GPG($F_{norm}=1, \alpha = 1$)                                | 43.9      | 23.3      | 76.3      | 52.5  | 30.1      | 37.4          |
-> | GPG($F_{norm}={std \{ R(o) \} }, \alpha = 1 $)               | 45.3      | 23.3      | 73.6      | 60.0  | 30.5      | 39.3          |
-> | GPG($F_{norm} =1, \alpha = \frac{B}{B-M}$)                   | 47.8      | 30.0      | 75.0      | 62.5  | 33.1      | 38.2          |
-> | GPG($F_{norm}$=1, $\alpha=\frac{B}{B-M}, \beta_{th}=0.6$)    | 48.3      | 30.0      | 76.2      | 62.5  | 34.2      | 39.0          |
-> | Dr. GRPO $^\dagger$                                          | 43.7      | 26.7      | 74.6      | 50.0  | 30.1      | 37.3          |
-
-## Experiments on multimodal tasks
-### Experiments on VisualThinker-R1-Zero
-
-Please refer to the training script: [`./VisualThinker-R1-Zero/src/open-r1-multimodal/run_grpo_SAT.sh`](./VisualThinker-R1-Zero/src/open-r1-multimodal/run_grpo_SAT.sh)
-
-The results are as follows:
-
-> Table: Visual reasoning results on CV-Bench, which shows GPG training on base model has overall better performance over GRPO training and the base model.
-> | Models                     | Total      | Count      | Relation    | Depth       | Distance   |
-> |----------------------------|:----------:|:----------:|:-----------:|:-----------:|:----------:|
-> | Qwen2-VL-2B                | 31.38      | 54.69      | 22.46       | 0.16        | 31.66      |
-> | + SFT                      | 57.84      | 60.02      | 68.92       | 55.00       | 45.83      |
-> | + GRPO                     | 59.47      | 59.64      | 66.76       | 54.16       | 56.66      |
-> | + GPG                      | 76.15      | 66.62      | 83.23       | 81.66       | 75.50      |
-
-
-### Experiments on Visual-RFT
-
-Please refer to the training script: [`./Visual-RFT/src/scripts/`](./Visual-RFT/src/scripts/)
-
-The results are as follows:
-
-> Table: Reasoning grounding results on LISA. GPG surpasses GRPO in reasoning grounding with 239 training images.
-> | Models                     | mIoU<sub>test</sub>  | mIoU<sub>val</sub>  | gIoU<sub>test</sub>  |
-> |----------------------------|:--------------------:|:-------------------:|:--------------------:|
-> | Qwen2-VL-2B                | 26.9                 | 30.1                | 25.3                 |
-> | + SFT                      | 28.3                 | 29.7                | 25.3                 |
-> | + GRPO                     | 37.6                 | 34.4                | 34.4                 |
-> | + GPG                      | 51.8                 | 51.3                | 50.4                 |
-
-
-> Table: 4-shot Results on Four Fine-grained Classification Datasets. GPG shows consistently better results than GRPO on $4$ classification datasets.
-> | Models          | Average   | Flower102 | Pets37    | FGVC      | Cars196   |
-> |-----------------|:---------:|:---------:|:---------:|:---------:|:---------:|
-> | Qwen2-VL-2B     | 56.0      | 54.8      | 66.4      | 45.9      | 56.8      |
-> | + SFT           | 55.6      | 58.5      | 55.5      | 67.9      | 40.5      |
-> | + GRPO          | 81.9      | 71.4      | 86.1      | 74.8      | 95.3      |
-> | + GPG           | 89.0      | 79.3      | 90.8      | 88.5      | 97.5      |
-
-### Experiments on R1-V
-
-Please refer to the training script: [`./R1-V/src/scripts/run_grpo_GEOQA_qwen2.5_3b.sh`](./R1-V/src/scripts/run_grpo_GEOQA_qwen2.5_3b.sh)
-
-> Table: Geometry reasoning results on GEOQA. GPG is better than GRPO.
-> | Models                     | GEOQA<sub>Test</sub>  |
-> |----------------------------|:---------------------:|
-> | Qwen2.5-VL-3B-Instruct     | 35.41                 |
-> | + GRPO                     | 47.48                 |
-> | + GPG                      | 51.33                 |
-
-
-
-## Q&A
-If you have any questions, please submit an [issue](https://github.com/AMAP-ML/GPG/issues/new) or contact huanghailang.hhl\<AT\>alibaba-inc.com.
-
-
-# Citation
-
-If you find GPG or code useful, please cite
-
-```bibtex
-@article{chu2025gpg,
-  title={Gpg: A simple and strong reinforcement learning baseline for model reasoning},
-  author={Chu, Xiangxiang and Huang, Hailang and Zhang, Xiao and Wei, Fei and Wang, Yong},
-  journal={ICLR},
-  year={2026}
-}
+```powershell
+cd open-r1
+powershell -ExecutionPolicy Bypass -File scripts\setup_win11.ps1
 ```
 
-## Acknowledgement
-We sincerely thank projects <a href="https://github.com/knoveleng/open-rs">open-rs</a>, <a href="https://github.com/turningpoint-ai/VisualThinker-R1-Zero">VisualThinker-R1-Zero</a>, <a href="https://github.com/Liuziyu77/Visual-RFT">Visual-RFT</a>, <a href="https://github.com/Deep-Agent/R1-V">R1-V</a>, <a href="https://github.com/huggingface/open-r1">Open-R1</a>, <a href="https://github.com/sail-sg/understand-r1-zero">understand-r1-zero(Dr.GRPO)</a>, and <a href="https://github.com/EvolvingLMMs-Lab/open-r1-multimodal">Open-r1-multimodal</a> for providing their open-source resources.
+腳本會自動檢查 Python 3.11、建立 `openr1_venv`、依 `experiment_config.yaml` 安裝鎖定版本的 CUDA PyTorch 與全部核心套件（不會執行 `pip install -e .`），並執行 `--check --strict` 驗證環境與 GPU。
+
+> 若組員使用 **RTX 50 系列（Blackwell, CC 12.0）**，請先將 `experiment_config.yaml` 的 `torch_version` 與 `torch_cuda_index_url` 改為支援 CUDA 12.8 (`cu128`) 的 PyTorch 2.7+ 後再執行 `setup_win11.ps1`。
+
+### 檢查現有環境是否與團隊一致
+
+```powershell
+cd open-r1
+$env:PYTHONPATH = "src"
+.\openr1_venv\Scripts\python.exe -m open_r1.experiment_config --check --strict
+```
+
+若只要印出修復指令而不中斷，可省略 `--strict`，或加上 `--print-setup` 印出完整 PowerShell 安裝指令。
+
+### 跨 CUDA GPU 自動相容規則
+
+`experiment_config.py` 在執行前會自動偵測本機顯示卡的 Compute Capability 與 VRAM：
+
+| 偵測項目 | 自動適配行為 |
+|---|---|
+| **Precision (`auto`)** | Ampere / Ada / Blackwell (`CC >= 8.0`) 用 `bf16`；Turing / Volta (`CC 7.x`，如 RTX 2060 / GTX 1660) 自動降級為 `fp16`；無 CUDA 退回 `fp32`。 |
+| **Attention (`auto`)** | Windows 下固定使用 PyTorch 內建 `sdpa`（Linux 且有 `flash_attn` + `CC >= 8.0` 才啟用 `flash_attention_2`）。 |
+| **VRAM Profile (`auto`)** | 依顯存自動歸類為 `vram_6gb` / `vram_8gb` / `vram_12gb` / `vram_16gb` / `vram_24gb_plus`，自動調整評測 `eval.batch_size` 與 `gradient_checkpointing`。 |
+| **公平對照鎖定** | `hardware.auto_adjust_training_hparams` 預設為 `false`，確保不同顯卡組員跑出的 `num_generations`、`max_completion_length`、`batch_size` 完全一致；若 VRAM 不足 6GB 想自動縮減生成參數，可於 YAML 改為 `true`。 |
+
+### 方法 B：手動建置虛擬環境（PowerShell）
+
+> **注意（Windows 請勿執行 `pip install -e .`）**：`open-r1/setup.py` 綁定了僅支援 Linux 的 `deepspeed==0.15.4`、`liger_kernel==0.5.3`、`vllm==0.7.2` 與 `bitsandbytes`，在 Windows 上直接 `pip install -e .` 會失敗。請依 `experiment_config.yaml` 鎖定版本手動安裝：
+
+```powershell
+cd open-r1
+python -m venv openr1_venv
+.\openr1_venv\Scripts\python.exe -m pip install --upgrade pip
+
+# 安裝 CUDA 12.4 版 PyTorch
+.\openr1_venv\Scripts\pip.exe install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+
+# 安裝訓練與評測所需核心套件（不裝 deepspeed / vllm / liger_kernel）
+.\openr1_venv\Scripts\pip.exe install `
+  transformers==4.50.0 `
+  trl==0.16.0 `
+  peft==0.22.0 `
+  accelerate==1.4.0 `
+  datasets==3.6.0 `
+  math-verify==0.5.2 `
+  latex2sympy2_extended==1.0.6 `
+  huggingface-hub==0.36.2 `
+  safetensors==0.8.0 `
+  tensorboard==2.21.0 `
+  pyyaml==6.0.4
+```
+
+### Step 2：下載基礎模型
+
+`open-r1/experiment_config.yaml` 預設讀取本地路徑 `models/Qwen2.5-0.5B-Instruct`（也可於執行 `compare_gpg_vs_cooldown.py` 時加上 `--auto_download` 自動抓取）：
+
+```powershell
+.\openr1_venv\Scripts\huggingface-cli.exe download Qwen/Qwen2.5-0.5B-Instruct `
+  --local-dir models/Qwen2.5-0.5B-Instruct
+```
+
+---
+
+## 3. 啟動訓練方式
+
+所有訓練與腳本皆於 **`GPG/open-r1` 目錄** 執行（執行集中設定模組時會自動補齊 `PYTHONPATH` 與 `PYTHONUTF8=1`）：
+
+### 方法 1（推薦）：集中設定檔 + 一鍵對照實驗
+
+所有實驗參數皆在 `open-r1/experiment_config.yaml` 修改；要測試不同模型或超參數，只需修改 `model:` 與 `experiments.run_tag`（以免覆蓋舊報告），並先用 `--dry_run` 檢查實際解析結果：
+
+```powershell
+cd open-r1
+
+# 1. 先做 dry-run，確認 GPU 偵測、套件版本、輸出路徑皆正確（不會啟動訓練）
+.\openr1_venv\Scripts\python.exe scripts\compare_gpg_vs_cooldown.py --dry_run
+
+# 2. 依 experiment_config.yaml 執行完整對照實驗
+.\openr1_venv\Scripts\python.exe scripts\compare_gpg_vs_cooldown.py
+
+# 3. 不改 YAML 臨時換模型測試（若本地沒有會自動從 --model_name_or_path 或 hf_repo_id 下載）
+.\openr1_venv\Scripts\python.exe scripts\compare_gpg_vs_cooldown.py `
+  --model_name_or_path models/Qwen2.5-1.5B-Instruct `
+  --run_tag qwen15b_200 `
+  --include_safesoft
+```
+
+> 若目標 `output_dir` 內已存在 `trainer_state.json`（且 `global_step >= max_steps`）與 `adapter_model.safetensors`，腳本會自動 `[SKIP]` 跳過訓練直接進入評測；若要重跑，請先刪除對應 `outputs/exp*` 資料夾或更改 `run_tag`。
+
+### 方法 2：單獨啟動訓練（直接呼叫 `gpg.py`）
+
+`gpg.py` 已支援直接傳入集中設定檔 `--config experiment_config.yaml`（會自動轉為相容的平坦 TRL YAML 並套用硬體適配），也維持相容舊版 `recipes/*.yaml`：
+
+```powershell
+$env:PYTHONPATH = "src"; $env:PYTHONUTF8 = "1"
+
+# 使用集中設定檔啟動單組訓練
+.\openr1_venv\Scripts\python.exe src/open_r1/gpg.py --config experiment_config.yaml
+
+# 覆蓋單一參數啟動 Baseline
+.\openr1_venv\Scripts\python.exe src/open_r1/gpg.py `
+  --config experiment_config.yaml `
+  --output_dir outputs/exp200_baseline_gpg `
+  --weighted_sample False
+```
+
+### 方法 3：重新生成數學資料集（選用）
+
+Repo 已內附 `open-r1/datas/math_200/train.jsonl`（200 題）與 `open-r1/datas/eval_100.jsonl`（100 題）。如需重新生成（`seed=2026`，10 種題型各 Train 20 / Eval 10 題，嚴格去重且零重疊）：
+
+```powershell
+.\openr1_venv\Scripts\python.exe scripts/generate_math_dataset.py
+```
+
+### 監控訓練曲線（TensorBoard）
+
+```powershell
+.\openr1_venv\Scripts\tensorboard.exe --logdir outputs
+```
+
+---
+
+## 4. 超參數改動對照表
+
+以下將目前實測設定 `open-r1/recipes/local_rtx4060_gpg_cooldown.yaml` 與 **官方 `GPGConfig` 預設值 / 官方 1.5B recipe（`recipes/Qwen2.5-1.5B-Instruct/gpg/config_v0.yaml`）** 做對照。
+
+### A. GPG 演算法與動態抽樣參數
+
+| 參數 | 官方預設 / `config_v0.yaml` | 本分支設定（`local_rtx4060_gpg_cooldown.yaml`） | 修改原因與說明 |
+|---|---|---|---|
+| `weighted_sample` | `False`（預設） | `true` | 啟用自適應抽樣權重與冷卻調度機制。 |
+| `sample_strategy` | `uniform`（預設） | `uniform` | 冷卻控制主要由 `cooldown_steps` 負責；另可切換 `soft`（已修補保底權重 `0.2` 與近 3 次滑動平均）、`hard`、`medium`。 |
+| `cooldown_steps` | *無（本分支新增）* | `20` | **核心新增參數**。題目全對後冷卻 20 個 `global_step` 不抽樣，期滿恢復權重 `1.0` 複習，避免浪費算力在已熟題並防止遺忘。 |
+| `min_inverse_alpha` | `0.5`（預設） | `0.0` | `inverse_alpha` 下限。設為 `0.0` 以觀察原始有效梯度比例；`train.sh` 原版多卡實驗則設 `0.5`。 |
+| `scale_rewards` | `True`（`GRPOConfig` 預設） | `false` | 關閉組內 reward 標準差縮放（對應 GPG 原論文／`train.sh` 去掉 std bias 的設定）。 |
+| `reward_funcs` | `["accuracy", "format", "tag_count"]` / `config_v0`: `format_v2, cosine` | `["accuracy"]` | 本地 200 題數學實驗直接以 `\boxed{}` 數學正確性（`accuracy_reward`）作為單一純淨訊號。 |
+| `reward_weights` | `config_v0`: `[1.0, 2.0]` | `[1.0]` | 配合單一 `accuracy` reward function。 |
+
+### B. 模型與 8GB VRAM 適配參數
+
+| 參數 | `config_v0.yaml`（伺服器多卡） | 本分支設定（RTX 4060 8GB） | 修改原因與說明 |
+|---|---|---|---|
+| `model_name_or_path` | `DeepSeek-R1-Distill-Qwen-1.5B` | `models/Qwen2.5-0.5B-Instruct` | 縮小基座模型至 0.5B，確保單卡 8GB VRAM 可做 G=8 rollout。 |
+| `attn_implementation` | `flash_attention_2` | `sdpa` | Windows 無須額外編譯 FlashAttention-2，使用 PyTorch 內建 SDPA。 |
+| `use_peft` | `false`（全參數微調） | `true` | 改用 LoRA 微調以大幅壓低優化器與梯度顯存需求。 |
+| `lora_r` / `lora_alpha` | *未啟用* | `8` / `16` | 輕量 LoRA rank 設定（`lora_dropout: 0.05`）。 |
+| `lora_target_modules` | *未啟用* | `["q_proj", "v_proj"]` | 僅針對 Attention 的 Q/V 投影層做 LoRA，兼顧顯存與訓練速度。 |
+| `torch_dtype` / `bf16` | `bfloat16` / `true` | `bfloat16` / `true` | RTX 40 系列（Ada 架構）原生支援 bf16。 |
+| `gradient_checkpointing` | `true`（`use_reentrant: false`） | `true`（`use_reentrant: false`） | 節省啟動值顯存；配合本分支在 `generate()` 暫時開啟 KV Cache 的修正，不影響推論速度。 |
+| `use_vllm` | `false`（部分 7B recipe 為 `true`） | `false` | Windows 不支援 vLLM，直接使用 Transformers `generate`。 |
+
+### C. 訓練排程與生成長度參數
+
+| 參數 | 官方預設 / `config_v0.yaml` | 本分支設定（`local_rtx4060_gpg_cooldown.yaml`） | 修改原因與說明 |
+|---|---|---|---|
+| `learning_rate` | `1.0e-06` | `5.0e-05` | 因從全參數微調改為 LoRA（`r=8`），學習率需放大（約 $50\times$）才能有效收斂。 |
+| `lr_scheduler_type` | 預設 `linear` / `config_v0`: `cosine_with_min_lr` | `cosine` | 搭配 `warmup_ratio: 0.1` 做餘弦退火。 |
+| `warmup_ratio` | `0.0`（預設） / `config_v0`: `0.1` | `0.1` | 前 10% 步數線性暖身，穩定初期 RL 策略梯度。 |
+| `num_generations` | `8`（預設） / `config_v0`: `6` | `8` | 每題採樣 8 條推理路徑（$G=8$），讓組內正負樣本對比與全對判斷更穩定。 |
+| `per_device_train_batch_size` | `8`（預設） / `config_v0`: `6` | `8` | 每步生成 1 題 × 8 rollouts（因本設定檔下必須為 `num_generations` 的整數倍）。 |
+| `gradient_accumulation_steps` | `1` | `1` | 單卡每步直接更新一次參數（對應 1 題 / step，200 steps 剛好掃過 200 題規模）。 |
+| `max_prompt_length` | `512` | `256` | 本地數學題 prompt 較短，縮減為 256 節省顯存。 |
+| `max_completion_length` | `256`（預設） / `config_v0`: `3584` | `192` | 配合 0.5B 模型與 8GB VRAM 限制單題生成長度；注意評測腳本 `evaluate_model` 使用 `max_new_tokens=256`。 |
+| `max_steps` / `num_train_epochs` | `config_v0`: `500` / `1` | `200` / `3` | 以 `max_steps: 200` 控制總步數（200 步剛好掃過 200 題規模；先前 60 步實測單組約耗時 615–734 秒）。 |
+| `save_strategy` / `save_steps` / `save_total_limit` | `steps` / `50` / 無限制 | `steps` / `50` / `2` | 每 50 步存一次並只保留最近 2 個 checkpoint，避免佔滿硬碟。 |
+| `seed` | `42` | `42` | 固定隨機種子確保對照實驗可復現。 |
+
+### 換到更大顯卡 / 更大資料集時的調整建議
+
+若組員使用 RTX 3090 / 4090（24GB+）或 A100 跑更大題庫，建議優先調整以下四項：
+1. `per_device_train_batch_size`：保持為 `num_generations` 的整數倍（例如設 `16` 或 `32`，代表每步取 2 或 4 題），並視需求拉大 `max_completion_length`（如 `512`–`1024`）。
+2. `cooldown_steps`：建議依資料集大小與每步題數同步調整；當每步只抽 1 題時，`cooldown_steps=20` 約等於該題冷卻 20 題的間隔。
+3. 若想做多輪對比實驗，優先使用 `--sample_strategy uniform` 與 `--sample_strategy soft` 搭配不同 `--cooldown_steps` 觀察 `inverse_alpha` 與泛化準確率變化。
+4. 若從 0.5B 換回 1.5B / 7B 全參微調，記得將 `learning_rate` 降回 `1.0e-06` 左右。
+
+---
+
+## 5. 現有實驗結果與輸出位置
+
+- **60 步初步對照報告**（已附在 repo 中）：見 [open-r1/outputs/comparison_report.md](open-r1/outputs/comparison_report.md)（含詳細數值 JSON：[comparison_report.json](open-r1/outputs/comparison_report.json)）。
+  - 在 60 steps（Train-24 / Eval-20）預實驗中，GPG + Cooldown 的後 10 步平均 Reward 達 `0.6250`（原版 `0.2250`）、平均有效梯度比例 `inverse_alpha` 提升至 `0.408`（原版 `0.308`）、且 `60/60` 步全為非零梯度（原版 `57/60`），Train-24 留存率 `62.5%` 高於原版 `58.3%`。
+- **200 步完整對照報告**：執行 `scripts/compare_gpg_vs_cooldown.py --max_steps 200` 後，會自動輸出至：
+  - `open-r1/outputs/comparison_report_200.md`
+  - `open-r1/outputs/comparison_report_200.json`

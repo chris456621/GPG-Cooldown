@@ -46,14 +46,18 @@ def _resolve_path_under_root(raw_path: str, root: Path = OPEN_R1_ROOT) -> Path:
 
 
 def detect_hardware(device_index: int = 0) -> dict[str, Any]:
-    """偵測目前作業系統、Python、PyTorch/CUDA 版本與 GPU 硬體資訊。"""
+    """偵測目前作業系統、Python、PyTorch/CUDA 或 Apple Silicon MPS 硬體資訊。"""
     cuda_available = torch.cuda.is_available()
+    mps_backend = getattr(torch.backends, "mps", None)
+    mps_available = bool(mps_backend is not None and mps_backend.is_available())
+    accelerator_backend = "cuda" if cuda_available else ("mps" if mps_available else "cpu")
+
     gpu_name = None
     total_vram_gb = 0.0
     free_vram_gb = 0.0
     cc: tuple[int, int] | None = None
     bf16_native = False
-    device_count = torch.cuda.device_count() if cuda_available else 0
+    device_count = torch.cuda.device_count() if cuda_available else (1 if mps_available else 0)
 
     if cuda_available and device_count > 0:
         idx = min(device_index, device_count - 1)
@@ -70,6 +74,15 @@ def detect_hardware(device_index: int = 0) -> dict[str, Any]:
             bf16_native = bool(torch.cuda.is_bf16_supported(including_emulation=False))
         except TypeError:
             bf16_native = cc[0] >= 8
+    elif mps_available:
+        gpu_name = f"Apple Silicon MPS ({platform.machine()})"
+        if hasattr(os, "sysconf"):
+            try:
+                mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                total_vram_gb = round(mem_bytes / (1024**3), 2)
+                free_vram_gb = total_vram_gb
+            except (ValueError, OSError):
+                pass
 
     os_name = platform.system()
     os_release = platform.release()
@@ -90,6 +103,8 @@ def detect_hardware(device_index: int = 0) -> dict[str, Any]:
         "torch_version": torch.__version__,
         "cuda_version": getattr(torch.version, "cuda", None),
         "cuda_available": cuda_available,
+        "mps_available": mps_available,
+        "accelerator_backend": accelerator_backend,
         "device_count": device_count,
         "gpu_name": gpu_name,
         "total_vram_gb": total_vram_gb,
@@ -102,11 +117,14 @@ def detect_hardware(device_index: int = 0) -> dict[str, Any]:
 
 
 def select_gpu_profile(hw: dict[str, Any], requested_profile: str) -> str:
-    """依 GPU 總 VRAM 選擇對應硬體檔位。"""
+    """依 GPU 總 VRAM 或 Apple Silicon MPS 選擇對應硬體檔位。"""
     if requested_profile and requested_profile not in ("auto", "manual"):
         return requested_profile
     if requested_profile == "manual":
         return "manual"
+    backend = hw.get("accelerator_backend") or ("cuda" if hw.get("cuda_available") else ("mps" if hw.get("mps_available") else "cpu"))
+    if backend == "mps":
+        return "mps_apple_silicon"
     if not hw.get("cuda_available"):
         return "vram_6gb"
 
@@ -118,13 +136,28 @@ def select_gpu_profile(hw: dict[str, Any], requested_profile: str) -> str:
 
 
 def resolve_precision(hw: dict[str, Any], requested: str) -> tuple[str, bool, bool, list[str]]:
-    """依 GPU Compute Capability 解析數值精度，回傳 (torch_dtype, bf16, fp16, warnings)。"""
+    """依 GPU Compute Capability / MPS 解析數值精度，回傳 (torch_dtype, bf16, fp16, warnings)。"""
     warnings: list[str] = []
     req = (requested or "auto").lower()
     cuda_ok = bool(hw.get("cuda_available"))
+    backend = hw.get("accelerator_backend") or ("cuda" if cuda_ok else ("mps" if hw.get("mps_available") else "cpu"))
     cc = hw.get("compute_capability")
     cc_major = cc[0] if cc else 0
     bf16_native = bool(hw.get("bf16_native")) or cc_major >= 8
+
+    if backend == "mps":
+        if req == "auto":
+            warnings.append("偵測到 Apple Silicon MPS，auto 精度使用 float32 (bf16=False, fp16=False) 以相容 HF Trainer。")
+            return "float32", False, False, warnings
+        if req == "fp32":
+            return "float32", False, False, warnings
+        if req == "fp16":
+            warnings.append("Apple Silicon MPS 手動指定 float16，維持 Trainer fp16=False 以避免 CUDA AMP 錯誤。")
+            return "float16", False, False, warnings
+        if req == "bf16":
+            warnings.append("Apple Silicon M1 無原生硬體 bf16；維持 Trainer bf16=False，僅在支援環境使用 torch_dtype=bfloat16。")
+            return "bfloat16", False, False, warnings
+        raise ValueError(f"不支援的 hardware.precision 設定: {requested!r}（僅支援 auto/bf16/fp16/fp32）")
 
     if not cuda_ok:
         if req in ("bf16", "fp16"):
@@ -157,20 +190,21 @@ def resolve_attn_implementation(hw: dict[str, Any], requested: str) -> tuple[str
     """依 OS 與安裝套件解析 Attention 實作方式。"""
     warnings: list[str] = []
     req = (requested or "auto").lower()
-    is_windows = str(hw.get("os", "")).lower().startswith("win")
+    os_lower = str(hw.get("os", "")).lower()
+    no_flash_os = os_lower.startswith("win") or os_lower == "darwin"
     has_flash = bool(hw.get("has_flash_attn"))
     cc = hw.get("compute_capability")
     cc_major = cc[0] if cc else 0
 
     if req == "auto":
-        if not is_windows and has_flash and cc_major >= 8:
+        if not no_flash_os and has_flash and cc_major >= 8:
             return "flash_attention_2", warnings
         return "sdpa", warnings
 
     if req == "flash_attention_2":
-        if is_windows or not has_flash or cc_major < 8:
+        if no_flash_os or not has_flash or cc_major < 8:
             warnings.append(
-                "要求使用 flash_attention_2，但目前環境不支援（Windows 或未安裝 flash_attn / CC < 8.0），已退回 sdpa。"
+                "要求使用 flash_attention_2，但目前環境不支援（Windows/macOS 或未安裝 flash_attn / CC < 8.0），已退回 sdpa。"
             )
             return "sdpa", warnings
         return "flash_attention_2", warnings
@@ -185,14 +219,26 @@ def _base_version(ver_str: str) -> str:
     return ver_str.split("+", 1)[0].strip()
 
 
-def format_win11_setup_commands(cfg: dict[str, Any]) -> str:
-    """從設定檔產生 Windows 11 PowerShell 一鍵安裝 / 修復指令。"""
+def format_setup_commands(cfg: dict[str, Any], os_name: str | None = None) -> str:
+    """從設定檔產生 Windows 11 或 macOS Apple Silicon 環境安裝 / 修復指令。"""
     env_cfg = cfg.get("environment", {})
     torch_ver = env_cfg.get("torch_version", "2.5.1")
     torch_url = env_cfg.get("torch_cuda_index_url", "https://download.pytorch.org/whl/cu124")
     pkgs = env_cfg.get("packages", {})
-    pkg_specs = " `\n  ".join(f"{name}=={ver}" for name, ver in pkgs.items())
+    target_os = (os_name or platform.system()).lower()
 
+    if target_os == "darwin":
+        pkg_specs = " \\\n  ".join(f"{name}=={ver}" for name, ver in pkgs.items())
+        lines = [
+            "# macOS Apple Silicon (MPS) 環境安裝 / 同步指令",
+            "./openr1_venv/bin/python -m pip install --upgrade pip",
+            f"./openr1_venv/bin/pip install torch=={torch_ver}",
+        ]
+        if pkg_specs:
+            lines.append(f"./openr1_venv/bin/pip install \\\n  {pkg_specs}")
+        return "\n".join(lines)
+
+    pkg_specs = " `\n  ".join(f"{name}=={ver}" for name, ver in pkgs.items())
     lines = [
         "# Windows 11 PowerShell 環境安裝 / 同步指令（請勿執行 pip install -e .）",
         ".\\openr1_venv\\Scripts\\python.exe -m pip install --upgrade pip",
@@ -201,6 +247,11 @@ def format_win11_setup_commands(cfg: dict[str, Any]) -> str:
     if pkg_specs:
         lines.append(f".\\openr1_venv\\Scripts\\pip.exe install `\n  {pkg_specs}")
     return "\n".join(lines)
+
+
+def format_win11_setup_commands(cfg: dict[str, Any]) -> str:
+    """相容保留：依目前 OS 產生環境安裝 / 修復指令。"""
+    return format_setup_commands(cfg, os_name=platform.system())
 
 
 def check_environment(cfg: dict[str, Any], hw: dict[str, Any], strict: bool = False) -> dict[str, Any]:
@@ -240,8 +291,13 @@ def check_environment(cfg: dict[str, Any], hw: dict[str, Any], strict: bool = Fa
         if not ok:
             mismatches.append(f"torch 預期 {torch_expected}，目前為 {torch_actual_raw}")
 
-    if not hw.get("cuda_available"):
-        mismatches.append("torch.cuda.is_available() 為 False，請確認是否安裝 CUDA 版 PyTorch 與 NVIDIA 驅動。")
+    has_accel = bool(
+        hw.get("cuda_available")
+        or hw.get("mps_available")
+        or hw.get("accelerator_backend") in ("cuda", "mps")
+    )
+    if not has_accel:
+        mismatches.append("未偵測到可用的 CUDA GPU 或 Apple Silicon MPS 加速器，請確認 PyTorch 安裝與驅動環境。")
 
     for pkg_name, expected_ver in env_cfg.get("packages", {}).items():
         expected_str = str(expected_ver).strip()
@@ -268,7 +324,7 @@ def check_environment(cfg: dict[str, Any], hw: dict[str, Any], strict: bool = Fa
         "passed": len(mismatches) == 0,
         "items": items,
         "mismatches": mismatches,
-        "fix_commands": format_win11_setup_commands(cfg),
+        "fix_commands": format_setup_commands(cfg, os_name=hw.get("os")),
     }
 
     if strict and mismatches:
@@ -326,9 +382,23 @@ def _validate_batch_and_generations(training: dict[str, Any]) -> None:
 
 def _format_template(value: Any, variables: dict[str, Any]) -> Any:
     if isinstance(value, str):
+        if value.startswith("{") and value.endswith("}") and value.count("{") == 1 and value.count("}") == 1:
+            key = value[1:-1]
+            if key in variables:
+                return variables[key]
         formatted = value.format(**variables)
-        if value.startswith("{") and value.endswith("}") and formatted.lstrip("-").isdigit():
-            return int(formatted)
+        if value.startswith("{") and value.endswith("}"):
+            low = formatted.strip().lower()
+            if low == "true":
+                return True
+            if low == "false":
+                return False
+            if formatted.lstrip("-").isdigit():
+                return int(formatted)
+            try:
+                return float(formatted)
+            except ValueError:
+                pass
         return formatted
     if isinstance(value, dict):
         return {k: _format_template(v, variables) for k, v in value.items()}
@@ -381,8 +451,9 @@ def load_and_resolve_config(
     warnings.extend(attn_warns)
 
     use_vllm = bool(hw_cfg.get("use_vllm", False))
-    if str(hw.get("os", "")).lower().startswith("win") and use_vllm:
-        warnings.append("Windows 不支援 vLLM，已強制將 use_vllm 設為 False。")
+    os_lower = str(hw.get("os", "")).lower()
+    if (os_lower.startswith("win") or os_lower == "darwin") and use_vllm:
+        warnings.append("Windows / macOS 不支援 vLLM，已強制將 use_vllm 設為 False。")
         use_vllm = False
 
     training = copy.deepcopy(cfg["training"])
@@ -537,6 +608,9 @@ def build_trl_config_dict(resolved: dict[str, Any], group_overrides: dict[str, A
         "weighted_sample": bool(gpg_cfg.get("weighted_sample", True)),
         "sample_strategy": str(gpg_cfg.get("sample_strategy", "uniform")),
         "cooldown_steps": int(gpg_cfg.get("cooldown_steps", 20)),
+        "cooldown_backoff": bool(gpg_cfg.get("cooldown_backoff", False)),
+        "cooldown_backoff_factor": float(gpg_cfg.get("cooldown_backoff_factor", 2.0)),
+        "cooldown_max_steps": int(gpg_cfg.get("cooldown_max_steps", 0)),
         "scale_batch": bool(gpg_cfg.get("scale_batch", False)),
         "adjust_lr": bool(gpg_cfg.get("adjust_lr", False)),
         "adjust_gd": bool(gpg_cfg.get("adjust_gd", False)),
@@ -557,16 +631,23 @@ def build_trl_config_dict(resolved: dict[str, Any], group_overrides: dict[str, A
     return trl_dict
 
 
-def resolve_experiment_groups(resolved: dict[str, Any], include_safesoft: bool = False) -> list[dict[str, Any]]:
+def resolve_experiment_groups(
+    resolved: dict[str, Any],
+    include_safesoft: bool = False,
+    only_cooldown: bool = False,
+) -> list[dict[str, Any]]:
     """依 experiments 設定展開每組實驗名稱、輸出目錄與 overrides。"""
     exp_cfg = resolved.get("experiments", {})
+    gpg_cfg = resolved["gpg"]
     run_tag = str(exp_cfg.get("run_tag", "200"))
-    cooldown_steps = int(resolved["gpg"].get("cooldown_steps", 20))
+    cooldown_steps = int(gpg_cfg.get("cooldown_steps", 20))
     out_template = str(exp_cfg.get("output_dir_template", "outputs/exp{run_tag}_{slug}"))
 
     expanded: list[dict[str, Any]] = []
     for grp in exp_cfg.get("groups", []):
         slug = str(grp["slug"])
+        if only_cooldown and slug == "baseline_gpg":
+            continue
         enabled = bool(grp.get("enabled", True))
         if include_safesoft and slug == "safesoft_cooldown":
             enabled = True
@@ -576,7 +657,11 @@ def resolve_experiment_groups(resolved: dict[str, Any], include_safesoft: bool =
         fmt_vars = {
             "run_tag": run_tag,
             "slug": slug,
+            "sample_strategy": str(gpg_cfg.get("sample_strategy", "uniform")),
             "cooldown_steps": cooldown_steps,
+            "cooldown_backoff": bool(gpg_cfg.get("cooldown_backoff", False)),
+            "cooldown_backoff_factor": float(gpg_cfg.get("cooldown_backoff_factor", 2.0)),
+            "cooldown_max_steps": int(gpg_cfg.get("cooldown_max_steps", 0)),
         }
         label = _format_template(str(grp.get("label", slug)), fmt_vars)
         out_dir = _resolve_path_under_root(_format_template(out_template, fmt_vars))
@@ -664,17 +749,20 @@ def prepare_gpg_cli_args(argv: list[str]) -> list[str]:
 
 
 def sync_win11_packages(cfg: dict[str, Any]) -> None:
-    """依設定檔鎖定版本在目前 Python 環境中執行 pip 安裝（不呼叫 pip install -e .）。"""
+    """依設定檔鎖定版本在目前 Python 環境中執行 pip 安裝（相容 Windows CUDA 與 macOS MPS）。"""
     env_cfg = cfg.get("environment", {})
     torch_ver = str(env_cfg.get("torch_version", "2.5.1"))
     torch_url = str(env_cfg.get("torch_cuda_index_url", "https://download.pytorch.org/whl/cu124"))
     pkgs = [f"{name}=={ver}" for name, ver in (env_cfg.get("packages", {}) or {}).items()]
 
     subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], check=True)
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", f"torch=={torch_ver}", "--index-url", torch_url],
-        check=True,
-    )
+    if platform.system() == "Darwin":
+        subprocess.run([sys.executable, "-m", "pip", "install", f"torch=={torch_ver}"], check=True)
+    else:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", f"torch=={torch_ver}", "--index-url", torch_url],
+            check=True,
+        )
     if pkgs:
         subprocess.run([sys.executable, "-m", "pip", "install", *pkgs], check=True)
 
@@ -683,9 +771,10 @@ def print_status_report(resolved: dict[str, Any]) -> None:
     hw = resolved["hardware_detected"]
     hr = resolved["hardware_resolved"]
     ec = resolved["env_check"]
+    backend = hw.get("accelerator_backend") or ("cuda" if hw.get("cuda_available") else ("mps" if hw.get("mps_available") else "cpu"))
     print("=== 硬體與環境檢查摘要 ===")
     print(f"OS / Python : {hw['os']} {hw['os_release']} | Python {hw['python_version']}")
-    print(f"PyTorch/CUDA: {hw['torch_version']} | CUDA={hw['cuda_version']} | available={hw['cuda_available']}")
+    print(f"PyTorch/Acc : {hw['torch_version']} | backend={backend} | CUDA={hw['cuda_version']}")
     print(
         f"GPU         : {hw['gpu_name']} | VRAM={hw['total_vram_gb']} GB (free {hw['free_vram_gb']} GB) "
         f"| CC={hw['compute_capability']} | bf16_native={hw['bf16_native']}"

@@ -86,11 +86,18 @@ hardware:
         max_completion_length: 256
     vram_24gb_plus:
       eval_batch_size: 32
-      gradient_checkpointing: false
+      gradient_checkpointing: true
       training_overrides:
         num_generations: 8
         per_device_train_batch_size: 8
         max_completion_length: 256
+    mps_apple_silicon:
+      eval_batch_size: 4
+      gradient_checkpointing: true
+      training_overrides:
+        num_generations: 4
+        per_device_train_batch_size: 4
+        max_completion_length: 192
 
 # ------------------------------------------------------------------------------
 # 3. 基礎模型、LoRA 與量化設定（換模型改這裡即可）
@@ -174,6 +181,9 @@ gpg:
   weighted_sample: true
   sample_strategy: "uniform"
   cooldown_steps: 20
+  cooldown_backoff: false
+  cooldown_backoff_factor: 2.0
+  cooldown_max_steps: 0
   scale_batch: false
   adjust_lr: false
   adjust_gd: false
@@ -202,16 +212,22 @@ experiments:
       overrides:
         weighted_sample: false
     - slug: "uniform_cooldown"
-      label: "GPG + Uniform Cooldown (Ours, cd={cooldown_steps})"
+      label: "GPG + Cooldown ({sample_strategy}, cd={cooldown_steps}, backoff={cooldown_backoff})"
       enabled: true
       overrides:
         weighted_sample: true
-        sample_strategy: "uniform"
+        sample_strategy: "{sample_strategy}"
         cooldown_steps: "{cooldown_steps}"
+        cooldown_backoff: "{cooldown_backoff}"
+        cooldown_backoff_factor: "{cooldown_backoff_factor}"
+        cooldown_max_steps: "{cooldown_max_steps}"
     - slug: "safesoft_cooldown"
-      label: "GPG + Safe-Soft Cooldown (Ours-Soft, cd={cooldown_steps})"
+      label: "GPG + Safe-Soft Cooldown (Ours-Soft, cd={cooldown_steps}, backoff={cooldown_backoff})"
       enabled: false
       overrides:
         weighted_sample: true
         sample_strategy: "soft"
         cooldown_steps: "{cooldown_steps}"
+        cooldown_backoff: "{cooldown_backoff}"
+        cooldown_backoff_factor: "{cooldown_backoff_factor}"
+        cooldown_max_steps: "{cooldown_max_steps}"

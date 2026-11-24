@@ -69,6 +69,18 @@ class GPGConfig(GRPOConfig):
         default=20,
         metadata={"help": "全對後冷卻的回合數（global_step），期滿後才重新抽樣複習"},
     )
+    cooldown_backoff: bool = field(
+        default=False,
+        metadata={"help": "是否啟用冷卻指數退避（連續全對時冷卻步數倍增，答錯歸零）"},
+    )
+    cooldown_backoff_factor: float = field(
+        default=2.0,
+        metadata={"help": "指數退避倍數（預設 2.0：cd -> 2*cd -> 4*cd）"},
+    )
+    cooldown_max_steps: int = field(
+        default=0,
+        metadata={"help": "指數退避冷卻上限步數（0 表示無上限）"},
+    )
     min_inverse_alpha: float = field(default=0.5, metadata={"help": "minimum inverse alpha"})
 
 

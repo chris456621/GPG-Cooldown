@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/open-r1/openr1_venv/Scripts/python.exe",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/open-r1/src",
+    "${workspaceFolder}/open-r1/scripts"
+  ]
+}

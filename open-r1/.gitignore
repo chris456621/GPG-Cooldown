@@ -183,7 +183,10 @@ results/
 openr1_venv/
 models/
 
-# Ignore training checkpoints, keep summary reports
+# Ignore training checkpoints, keep empty dir marker and summary/comparison reports
 outputs/*
-!outputs/comparison_report.md
-!outputs/comparison_report.json
+!outputs/.gitkeep
+!outputs/comparison_report*.md
+!outputs/comparison_report*.json
+!outputs/summary_all_experiments.md
+!outputs/summary_all_experiments.csv
