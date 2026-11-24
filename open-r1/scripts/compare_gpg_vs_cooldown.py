@@ -1,17 +1,18 @@
 """
-一鍵對照腳本（Train 200 題 / Eval 100 題 / num_generations=8）：
-使用相同模型 (models/Qwen2.5-0.5B-Instruct) 比較：
+統一對照實驗啟動器（由 experiment_config.yaml 集中驅動）：
+比較：
 1. Base Model（未訓練）
-2. GPG 原版（--weighted_sample False, 均勻抽樣）
-3. GPG + Uniform Cooldown（--weighted_sample True --sample_strategy uniform --cooldown_steps 20）
-4. [可選 --include_safesoft] GPG + Safe-Soft Cooldown（修完保底權重 0.2 的 weight_soft + cooldown 20）
+2. GPG 原版（Uniform 均勻抽樣）
+3. GPG + Uniform Cooldown（Ours）
+4. [可選 --include_safesoft 或 YAML enabled=true] GPG + Safe-Soft Cooldown
 
 用法（於 C:\\Users\\chris\\Desktop\\GPG\\open-r1 執行）:
-    $env:PYTHONPATH = "src"; $env:PYTHONUTF8 = "1"
-    .\\openr1_venv\\Scripts\\python.exe scripts/compare_gpg_vs_cooldown.py --max_steps 200
-    # 若想順便多跑一組 Safe-Soft + Cooldown：
-    .\\openr1_venv\\Scripts\\python.exe scripts/compare_gpg_vs_cooldown.py --max_steps 200 --include_safesoft
+    .\\openr1_venv\\Scripts\\python.exe scripts/compare_gpg_vs_cooldown.py
+    .\\openr1_venv\\Scripts\\python.exe scripts/compare_gpg_vs_cooldown.py --dry_run
+    .\\openr1_venv\\Scripts\\python.exe scripts/compare_gpg_vs_cooldown.py --model_name_or_path models/Qwen2.5-1.5B-Instruct --run_tag qwen15b_200
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -19,8 +20,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
+import yaml
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -31,32 +34,95 @@ for p in (str(SRC_DIR), str(SCRIPTS_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from generate_math_dataset import EVAL_PATH, TRAIN_DIR, generate_datasets
+from generate_math_dataset import generate_datasets
+from open_r1.experiment_config import (
+    DEFAULT_CONFIG_PATH,
+    build_env_snapshot,
+    build_trl_config_dict,
+    export_trl_yaml,
+    load_and_resolve_config,
+    print_status_report,
+    resolve_experiment_groups,
+)
 from open_r1.rewards import accuracy_reward  # 內含 Windows math_verify patch
 
-BASE_MODEL = ROOT / "models" / "Qwen2.5-0.5B-Instruct"
-CONFIG_PATH = ROOT / "recipes" / "local_rtx4060_gpg_cooldown.yaml"
-TRAIN_FILE = TRAIN_DIR / "train.jsonl"
-SYSTEM_PROMPT = (
-    "You are a helpful math assistant. Solve the problem step by step and put the final answer inside \\boxed{}."
-)
+
+def _resolve_root_path(raw: str | Path) -> Path:
+    p = Path(raw)
+    return p if p.is_absolute() else (ROOT / p)
 
 
-def ensure_datasets():
-    """確認 Train 200 題與 Eval 100 題存在，不存在則自動生成。"""
-    if TRAIN_FILE.exists() and EVAL_PATH.exists():
-        with open(TRAIN_FILE, encoding="utf-8") as f:
+def ensure_datasets(resolved: dict[str, Any]) -> tuple[Path, Path]:
+    """確認訓練與評測資料集存在且筆數符合設定，否則依設定自動生成。"""
+    ds_cfg = resolved["dataset"]
+    train_file = _resolve_root_path(ds_cfg["train_file"])
+    eval_file = _resolve_root_path(ds_cfg["eval_file"])
+
+    expected_train = int(ds_cfg.get("train_per_cat", 20)) * 10
+    expected_eval = int(ds_cfg.get("eval_per_cat", 10)) * 10
+
+    if train_file.exists() and eval_file.exists():
+        with open(train_file, encoding="utf-8") as f:
             n_tr = sum(1 for line in f if line.strip())
-        with open(EVAL_PATH, encoding="utf-8") as f:
+        with open(eval_file, encoding="utf-8") as f:
             n_ev = sum(1 for line in f if line.strip())
-        if n_tr == 200 and n_ev == 100:
+        if n_tr == expected_train and n_ev == expected_eval:
             print(f"[DATA] 使用現有資料集：Train={n_tr} 題, Eval={n_ev} 題")
-            return
-    generate_datasets(train_per_cat=20, eval_per_cat=10, seed=2026)
+            return train_file, eval_file
+
+    if not ds_cfg.get("auto_generate", True):
+        raise FileNotFoundError(f"找不到資料集：{train_file} 或 {eval_file}")
+
+    generate_datasets(
+        train_per_cat=int(ds_cfg.get("train_per_cat", 20)),
+        eval_per_cat=int(ds_cfg.get("eval_per_cat", 10)),
+        seed=int(ds_cfg.get("seed", 2026)),
+        train_file=train_file,
+        eval_file=eval_file,
+    )
+    return train_file, eval_file
 
 
-def run_training_if_needed(name: str, output_dir: Path, extra_args: list[str], max_steps: int):
-    """若該組實驗尚未跑完指定 steps，自動呼叫 gpg.py 執行。"""
+def ensure_model_available(resolved: dict[str, Any], auto_download: bool) -> Path | str:
+    """確認基礎模型存在；若為不存在的本地路徑且開啟 auto_download，從 HuggingFace 下載。"""
+    model_cfg = resolved["model"]
+    raw_name = str(model_cfg["name_or_path"])
+    local_candidate = _resolve_root_path(raw_name)
+    if local_candidate.exists():
+        return local_candidate
+
+    # 若看起來是本地目錄路徑（含 models/ 或磁碟路徑）但不存在
+    looks_local = raw_name.startswith(("models/", "models\\", "./", ".\\")) or Path(raw_name).is_absolute()
+    if looks_local:
+        hf_repo = model_cfg.get("hf_repo_id")
+        if auto_download and hf_repo:
+            from huggingface_hub import snapshot_download
+
+            print(f"[MODEL] 本地模型不存在，開始下載 {hf_repo} -> {local_candidate} ...")
+            local_candidate.parent.mkdir(parents=True, exist_ok=True)
+            snapshot_download(
+                repo_id=str(hf_repo),
+                revision=str(model_cfg.get("revision", "main")),
+                local_dir=str(local_candidate),
+            )
+            return local_candidate
+        raise FileNotFoundError(
+            f"找不到本地模型路徑: {local_candidate}\n"
+            f"請先下載模型（或加上 --auto_download 由 {hf_repo} 自動下載）。"
+        )
+
+    # 否則視為 HuggingFace Hub repo id
+    return raw_name
+
+
+def run_training_if_needed(
+    name: str,
+    output_dir: Path,
+    trl_dict: dict[str, Any],
+    env_snapshot: dict[str, Any],
+    max_steps: int,
+) -> None:
+    """若該組實驗尚未跑完指定 steps，將解析後設定存檔並呼叫 gpg.py 執行。"""
     state_file = output_dir / "trainer_state.json"
     if state_file.exists():
         with open(state_file, encoding="utf-8") as f:
@@ -64,6 +130,12 @@ def run_training_if_needed(name: str, output_dir: Path, extra_args: list[str], m
         if st.get("global_step", 0) >= max_steps and (output_dir / "adapter_model.safetensors").exists():
             print(f"[SKIP] {name} 已完成 ({st['global_step']} steps): {output_dir}")
             return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_yaml_path = output_dir / "resolved_trl_config.yaml"
+    snapshot_path = output_dir / "env_snapshot.json"
+    export_trl_yaml(trl_dict, resolved_yaml_path)
+    snapshot_path.write_text(json.dumps(env_snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"[RUN] 啟動 {name} 訓練（{max_steps} steps）...")
     env = os.environ.copy()
@@ -73,18 +145,13 @@ def run_training_if_needed(name: str, output_dir: Path, extra_args: list[str], m
         sys.executable,
         str(ROOT / "src" / "open_r1" / "gpg.py"),
         "--config",
-        str(CONFIG_PATH),
-        "--output_dir",
-        str(output_dir),
-        "--max_steps",
-        str(max_steps),
-        *extra_args,
+        str(resolved_yaml_path),
     ]
     subprocess.run(cmd, cwd=str(ROOT), env=env, check=True)
     print(f"[DONE] {name} 訓練完成！")
 
 
-def parse_train_logs(output_dir: Path) -> dict:
+def parse_train_logs(output_dir: Path) -> dict[str, Any]:
     with open(output_dir / "trainer_state.json", encoding="utf-8") as f:
         st = json.load(f)
     with open(output_dir / "train_results.json", encoding="utf-8") as f:
@@ -99,7 +166,7 @@ def parse_train_logs(output_dir: Path) -> dict:
     n = len(rewards)
     q = max(1, n // 4)
 
-    def avg(xs):
+    def avg(xs: list[float]) -> float:
         return sum(xs) / len(xs) if xs else 0.0
 
     return {
@@ -116,39 +183,79 @@ def parse_train_logs(output_dir: Path) -> dict:
     }
 
 
-def load_jsonl(path: Path) -> list[dict]:
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def _format_chat_prompt(tokenizer: AutoTokenizer, system_prompt: str | None, problem: str) -> str:
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": problem})
+    try:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        # 部分模型不支援 system role，改將 system prompt 併入 user prompt
+        merged = f"{system_prompt}\n\n{problem}" if system_prompt else problem
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": merged}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+
 @torch.inference_mode()
-def evaluate_model(name: str, adapter_dir: Path | None, dataset: list[dict], batch_size: int = 16) -> dict:
-    """用確定性貪婪解碼 (do_sample=False) 評測模型準確率。"""
-    print(f"[EVAL] 評測 {name}（共 {len(dataset)} 題）...")
-    tokenizer = AutoTokenizer.from_pretrained(str(BASE_MODEL))
+def evaluate_model(
+    name: str,
+    model_source: Path | str,
+    adapter_dir: Path | None,
+    dataset: list[dict[str, Any]],
+    resolved: dict[str, Any],
+) -> dict[str, Any]:
+    """依集中設定檔解析後的精度、attention 與解碼參數評測模型準確率。"""
+    model_cfg = resolved["model"]
+    hw_res = resolved["hardware_resolved"]
+    eval_cfg = resolved["evaluation"]
+    system_prompt = resolved["dataset"].get("system_prompt")
+    batch_size = int(eval_cfg["batch_size"])
+    max_new_tokens = int(eval_cfg["max_new_tokens"])
+    do_sample = bool(eval_cfg["do_sample"])
+    trust_remote_code = bool(model_cfg.get("trust_remote_code", False))
+
+    dtype_name = hw_res["torch_dtype"]
+    torch_dtype = getattr(torch, dtype_name)
+
+    print(f"[EVAL] 評測 {name}（共 {len(dataset)} 題, dtype={dtype_name}, bs={batch_size}）...")
+    tokenizer = AutoTokenizer.from_pretrained(str(model_source), trust_remote_code=trust_remote_code)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    model = AutoModelForCausalLM.from_pretrained(
-        str(BASE_MODEL),
-        torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-        device_map="auto",
-    )
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "attn_implementation": hw_res["attn_implementation"],
+        "device_map": "auto",
+        "trust_remote_code": trust_remote_code,
+    }
+    quant_cfg = model_cfg.get("quantization", {}) or {}
+    if quant_cfg.get("load_in_4bit"):
+        from transformers import BitsAndBytesConfig
+
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=str(quant_cfg.get("bnb_4bit_quant_type", "nf4")),
+            bnb_4bit_use_double_quant=bool(quant_cfg.get("use_bnb_nested_quant", False)),
+            bnb_4bit_compute_dtype=torch_dtype,
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(str(model_source), **load_kwargs)
     if adapter_dir is not None:
         model = PeftModel.from_pretrained(model, str(adapter_dir))
     model.eval()
 
-    prompts_text = []
-    solutions = []
-    for row in dataset:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": row["problem"]},
-        ]
-        prompts_text.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
-        solutions.append(row["solution"])
+    prompts_text = [_format_chat_prompt(tokenizer, system_prompt, row["problem"]) for row in dataset]
+    solutions = [row["solution"] for row in dataset]
 
     completions = []
     for i in range(0, len(prompts_text), batch_size):
@@ -156,8 +263,8 @@ def evaluate_model(name: str, adapter_dir: Path | None, dataset: list[dict], bat
         inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(model.device)
         out = model.generate(
             **inputs,
-            max_new_tokens=256,
-            do_sample=False,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
             pad_token_id=tokenizer.pad_token_id,
         )
         gen_ids = out[:, inputs["input_ids"].shape[1] :]
@@ -170,7 +277,8 @@ def evaluate_model(name: str, adapter_dir: Path | None, dataset: list[dict], bat
     acc = correct / len(scores)
 
     del model
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return {
         "correct": correct,
@@ -180,58 +288,35 @@ def evaluate_model(name: str, adapter_dir: Path | None, dataset: list[dict], bat
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max_steps", type=int, default=200, help="每組訓練總步數（預設 200 = 1 full epoch）")
-    parser.add_argument("--cooldown_steps", type=int, default=20, help="全對後冷卻步數")
-    parser.add_argument("--include_safesoft", action="store_true", help="是否額外加跑 Safe-Soft + Cooldown 組")
-    args = parser.parse_args()
+def render_comparison_report_md(
+    resolved: dict[str, Any],
+    train_count: int,
+    eval_count: int,
+    train_logs: dict[str, Any],
+    eval_results: dict[str, Any],
+) -> str:
+    """組裝包含完整環境、關鍵超參數、比較結果與完整 experiment_config.yaml 的 Markdown 報告。"""
+    hw = resolved["hardware_detected"]
+    hr = resolved["hardware_resolved"]
+    model_cfg = resolved["model"]
+    lora = model_cfg["lora"]
+    quant = model_cfg["quantization"]
+    tr = resolved["training"]
+    gpg = resolved["gpg"]
+    ev = resolved["evaluation"]
+    model_display = Path(str(model_cfg["name_or_path"])).name
+    decode_mode = "Sampling" if ev["do_sample"] else "Greedy Decoding"
+    max_steps = int(tr["max_steps"])
+    cuda_ver = hw.get("cuda_version") or "N/A"
+    effective_yaml = yaml.safe_dump(resolved["effective_config"], allow_unicode=True, sort_keys=False).rstrip()
 
-    ensure_datasets()
-
-    experiments = [
-        (
-            "GPG 原版 (Uniform)",
-            ROOT / "outputs" / "exp200_baseline_gpg",
-            ["--weighted_sample", "False"],
-        ),
-        (
-            f"GPG + Uniform Cooldown (Ours, cd={args.cooldown_steps})",
-            ROOT / "outputs" / "exp200_uniform_cooldown",
-            ["--weighted_sample", "True", "--sample_strategy", "uniform", "--cooldown_steps", str(args.cooldown_steps)],
-        ),
-    ]
-    if args.include_safesoft:
-        experiments.append(
-            (
-                f"GPG + Safe-Soft Cooldown (Ours-Soft, cd={args.cooldown_steps})",
-                ROOT / "outputs" / "exp200_safesoft_cooldown",
-                ["--weighted_sample", "True", "--sample_strategy", "soft", "--cooldown_steps", str(args.cooldown_steps)],
-            )
-        )
-
-    for name, out_dir, extra in experiments:
-        run_training_if_needed(name, out_dir, extra, max_steps=args.max_steps)
-
-    train_data = load_jsonl(TRAIN_FILE)
-    eval_data = load_jsonl(EVAL_PATH)
-
-    train_logs = {name: parse_train_logs(out_dir) for name, out_dir, _ in experiments}
-
-    eval_targets = [("Base (Qwen2.5-0.5B-Instruct)", None)] + [(name, out_dir) for name, out_dir, _ in experiments]
-    eval_results = {}
-    for label, adapter in eval_targets:
-        eval_results[label] = {
-            "train_200": evaluate_model(f"{label} [Train-200]", adapter, train_data),
-            "eval_100": evaluate_model(f"{label} [Eval-100]", adapter, eval_data),
-        }
-
-    # 產生 Markdown 報告
     lines = [
-        f"# GPG 原版 vs. 改良版 對照報告（Train 200 / Eval 100 / G=8 / {args.max_steps} Steps）",
+        f"# GPG 原版 vs. 改良版 對照報告（Train {train_count} / Eval {eval_count} / G={tr['num_generations']} / {max_steps} Steps）",
         "",
-        "- **基礎模型**：`Qwen2.5-0.5B-Instruct`（LoRA `r=8`, `bf16`, `sdpa`, `num_generations=8`, `seed=42`）",
-        "- **評測方式**：Greedy Decoding（`do_sample=False`, `max_new_tokens=256`）",
+        f"1. **基礎模型**：`{model_display}`（`name_or_path={model_cfg['name_or_path']}`, `hf_repo_id={model_cfg.get('hf_repo_id')}` | `dtype={hr['torch_dtype']}` (`bf16={hr['bf16']}`, `fp16={hr['fp16']}`), `attn={hr['attn_implementation']}` | LoRA: `enabled={lora['enabled']}`, `r={lora['r']}`, `alpha={lora['alpha']}`, `dropout={lora['dropout']}`, `target_modules={lora['target_modules']}` | 4-bit: `load_in_4bit={quant['load_in_4bit']}`）",
+        f"2. **硬體與環境**：GPU=`{hw['gpu_name']}` | VRAM=`{hw['total_vram_gb']} GB` (free `{hw['free_vram_gb']} GB`), `CC={hw['compute_capability']}`, `profile={hr['profile']}` | OS=`{hw['os']} {hw['os_release']}` | Python=`{hw['python_version']}` | PyTorch=`{hw['torch_version']}` (CUDA `{cuda_ver}`) | Config SHA256=`{resolved['config_sha256'][:12]}`",
+        f"3. **評測方式**：{decode_mode}（`do_sample={ev['do_sample']}`, `max_new_tokens={ev['max_new_tokens']}`, `batch_size={ev['batch_size']}`）",
+        f"4. **重要參數**：`Train={train_count}` / `Eval={eval_count}` / `G={tr['num_generations']}` / `Steps={max_steps}` | `L={tr['max_completion_length']}`, `max_prompt_length={tr['max_prompt_length']}`, `per_device_train_batch_size={tr['per_device_train_batch_size']}`, `gradient_accumulation_steps={tr['gradient_accumulation_steps']}`, `learning_rate={tr['learning_rate']}`, `lr_scheduler_type={tr['lr_scheduler_type']}`, `warmup_ratio={tr['warmup_ratio']}`, `cooldown_steps={gpg['cooldown_steps']}`, `sample_strategy={gpg['sample_strategy']}`, `scale_rewards={gpg['scale_rewards']}`, `min_inverse_alpha={gpg['min_inverse_alpha']}`, `seed={tr['seed']}`",
         "",
         "## 1. 訓練過程指標比較",
         "",
@@ -247,25 +332,149 @@ def main():
 
     lines += [
         "",
-        "## 2. 確定性評測結果（Train-200 留存率 & Eval-100 泛化力）",
+        f"## 2. 確定性評測結果（Train-{train_count} 留存率 & Eval-{eval_count} 泛化力）",
         "",
-        "| 模型版本 | Train-200 留存率（答對/總數） | Eval-100 泛化準確率（答對/總數） |",
+        f"| 模型版本 | Train-{train_count} 留存率（答對/總數） | Eval-{eval_count} 泛化準確率（答對/總數） |",
         "|---|---:|---:|",
     ]
     for label, res in eval_results.items():
-        tr = res["train_200"]
-        ev = res["eval_100"]
+        tr_res = res["train_200"]
+        ev_res = res["eval_100"]
         lines.append(
-            f"| {label} | {tr['accuracy']*100:.1f}% ({tr['correct']}/{tr['total']}) "
-            f"| {ev['accuracy']*100:.1f}% ({ev['correct']}/{ev['total']}) |"
+            f"| {label} | {tr_res['accuracy']*100:.1f}% ({tr_res['correct']}/{tr_res['total']}) "
+            f"| {ev_res['accuracy']*100:.1f}% ({ev_res['correct']}/{ev_res['total']}) |"
         )
 
-    md = "\n".join(lines) + "\n"
-    report_md_path = ROOT / "outputs" / "comparison_report_200.md"
-    report_json_path = ROOT / "outputs" / "comparison_report_200.json"
+    lines += [
+        "",
+        "## 3. 完整實驗設定（experiment_config.yaml）",
+        "",
+        "```yaml",
+        effective_yaml,
+        "```",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _build_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if args.model_name_or_path:
+        overrides.setdefault("model", {})["name_or_path"] = args.model_name_or_path
+    if args.run_tag:
+        overrides.setdefault("experiments", {})["run_tag"] = args.run_tag
+    if args.max_steps is not None:
+        overrides.setdefault("training", {})["max_steps"] = args.max_steps
+    if args.cooldown_steps is not None:
+        overrides.setdefault("gpg", {})["cooldown_steps"] = args.cooldown_steps
+    if args.precision:
+        overrides.setdefault("hardware", {})["precision"] = args.precision
+    if args.gpu_profile:
+        overrides.setdefault("hardware", {})["gpu_profile"] = args.gpu_profile
+    return overrides
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="由 experiment_config.yaml 驅動的 GPG vs Cooldown 對照實驗")
+    parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH), help="集中設定檔路徑")
+    parser.add_argument("--model_name_or_path", type=str, default=None, help="覆蓋基礎模型路徑或 HF repo id")
+    parser.add_argument("--run_tag", type=str, default=None, help="覆蓋 experiments.run_tag（避免覆蓋舊實驗）")
+    parser.add_argument("--max_steps", type=int, default=None, help="覆蓋每組訓練總步數")
+    parser.add_argument("--cooldown_steps", type=int, default=None, help="覆蓋全對後冷卻步數")
+    parser.add_argument("--include_safesoft", action="store_true", help="額外啟用 Safe-Soft + Cooldown 組")
+    parser.add_argument("--precision", type=str, default=None, help="覆蓋 hardware.precision (auto/bf16/fp16/fp32)")
+    parser.add_argument("--gpu_profile", type=str, default=None, help="覆蓋 hardware.gpu_profile")
+    parser.add_argument("--strict_env", action="store_true", help="套件或 Python/PyTorch 版本不符時直接中止")
+    parser.add_argument("--auto_download", action="store_true", help="本地模型不存在時自動由 hf_repo_id 下載")
+    parser.add_argument("--dry_run", action="store_true", help="僅檢查環境與顯示實際執行計畫，不訓練不評測")
+    args = parser.parse_args()
+
+    cli_overrides = _build_cli_overrides(args)
+    resolved = load_and_resolve_config(
+        args.config,
+        cli_overrides=cli_overrides,
+        strict_env=True if args.strict_env else None,
+        quiet=False,
+    )
+    print_status_report(resolved)
+
+    groups = resolve_experiment_groups(resolved, include_safesoft=args.include_safesoft)
+    if not groups:
+        raise RuntimeError("experiments.groups 沒有任何啟用的實驗組別。")
+
+    exp_cfg = resolved["experiments"]
+    run_tag = str(exp_cfg.get("run_tag", "200"))
+    report_md_path = _resolve_root_path(str(exp_cfg.get("report_md", f"outputs/comparison_report_{run_tag}.md")).format(run_tag=run_tag))
+    report_json_path = _resolve_root_path(str(exp_cfg.get("report_json", f"outputs/comparison_report_{run_tag}.json")).format(run_tag=run_tag))
+    max_steps = int(resolved["training"]["max_steps"])
+
+    if args.dry_run:
+        print("\n=== [DRY RUN] 預計執行計畫（不會修改現有 outputs 或開始訓練） ===")
+        print(f"Model      : {resolved['model']['name_or_path']} (LoRA={resolved['model']['lora']['enabled']}, 4bit={resolved['model']['quantization']['load_in_4bit']})")
+        print(f"Dataset    : {resolved['dataset']['train_file']} / {resolved['dataset']['eval_file']}")
+        print(f"Report MD  : {report_md_path}")
+        print(f"Report JSON: {report_json_path}")
+        for grp in groups:
+            trl_preview = build_trl_config_dict(resolved, grp["overrides"])
+            print(
+                f"  - [{grp['slug']}] {grp['label']}\n"
+                f"      output_dir={grp['output_dir']} | max_steps={trl_preview['max_steps']} "
+                f"| G={trl_preview['num_generations']} | bs={trl_preview['per_device_train_batch_size']} "
+                f"| L={trl_preview['max_completion_length']} | dtype={trl_preview['torch_dtype']} "
+                f"| weighted={trl_preview['weighted_sample']} | strategy={trl_preview['sample_strategy']} "
+                f"| cooldown={trl_preview['cooldown_steps']}"
+            )
+        return
+
+    train_file, eval_file = ensure_datasets(resolved)
+    model_source = ensure_model_available(resolved, auto_download=args.auto_download)
+    env_snapshot = build_env_snapshot(resolved)
+
+    for grp in groups:
+        trl_dict = build_trl_config_dict(resolved, grp["overrides"])
+        trl_dict["model_name_or_path"] = str(model_source)
+        run_training_if_needed(
+            name=grp["label"],
+            output_dir=grp["output_dir"],
+            trl_dict=trl_dict,
+            env_snapshot=env_snapshot,
+            max_steps=int(trl_dict["max_steps"]),
+        )
+
+    train_data = load_jsonl(train_file)
+    eval_data = load_jsonl(eval_file)
+    train_logs = {grp["label"]: parse_train_logs(grp["output_dir"]) for grp in groups}
+
+    model_display = Path(str(resolved["model"]["name_or_path"])).name
+    eval_targets: list[tuple[str, Path | None]] = [(f"Base ({model_display})", None)] + [
+        (grp["label"], grp["output_dir"]) for grp in groups
+    ]
+    eval_results = {}
+    for label, adapter in eval_targets:
+        eval_results[label] = {
+            "train_200": evaluate_model(f"{label} [Train-{len(train_data)}]", model_source, adapter, train_data, resolved),
+            "eval_100": evaluate_model(f"{label} [Eval-{len(eval_data)}]", model_source, adapter, eval_data, resolved),
+        }
+
+    md = render_comparison_report_md(
+        resolved=resolved,
+        train_count=len(train_data),
+        eval_count=len(eval_data),
+        train_logs=train_logs,
+        eval_results=eval_results,
+    )
+    report_md_path.parent.mkdir(parents=True, exist_ok=True)
     report_md_path.write_text(md, encoding="utf-8")
     report_json_path.write_text(
-        json.dumps({"train_logs": train_logs, "eval": eval_results}, indent=2, ensure_ascii=False),
+        json.dumps(
+            {
+                "env_snapshot": env_snapshot,
+                "experiment_config": resolved["effective_config"],
+                "train_logs": train_logs,
+                "eval": eval_results,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     print("\n" + md)

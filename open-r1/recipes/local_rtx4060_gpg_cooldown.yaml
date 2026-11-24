@@ -36,7 +36,7 @@ lr_scheduler_type: cosine
 max_prompt_length: 256
 max_completion_length: 192
 max_steps: 200
-num_generations: 8
+num_generations: 4
 num_train_epochs: 3
 output_dir: outputs/exp200_uniform_cooldown
 overwrite_output_dir: true

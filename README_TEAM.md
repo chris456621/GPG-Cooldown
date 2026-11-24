@@ -25,33 +25,54 @@
    - **Windows `math_verify` Patch**：Windows 沒有 `signal.SIGALRM`，`math_verify` 預設每次 `parse`/`verify` 會 spawn 子進程導致 `WinError 6` 且驗算恆為 `0`。在非 POSIX 系統上自動將 `math_verify` 的 `timeout` 替換為 no-op，確保數學答案批改正常運作。
 
 4. **新增實驗與輔助檔案**
-   - `open-r1/recipes/local_rtx4060_gpg_cooldown.yaml`：單卡 RTX 4060 8GB LoRA + GPG Cooldown 設定檔。
-   - `open-r1/scripts/compare_gpg_vs_cooldown.py`：一鍵跑完原版 GPG 與 Cooldown 改良版訓練，並在 Base / Train-200 / Eval-100 上做 Greedy Decoding 評測與產出報表。
+   - `open-r1/experiment_config.yaml`：**唯一集中設定檔（Single Source of Truth）**，統一管理 Windows 11 套件版本、CUDA GPU 自動相容規則、模型/LoRA/量化、資料集、訓練排程、GPG Cooldown 與對照實驗組別。
+   - `open-r1/src/open_r1/experiment_config.py`：設定解析、Windows 11 套件檢查與不同 CUDA GPU 自動偵測/適配模組。
+   - `open-r1/scripts/setup_win11.ps1`：Windows 11 一鍵建置 `openr1_venv` 與套件同步腳本。
+   - `open-r1/recipes/local_rtx4060_gpg_cooldown.yaml`：單卡 RTX 4060 8GB 舊版平坦設定檔（仍保留向後相容）。
+   - `open-r1/scripts/compare_gpg_vs_cooldown.py`：由 `experiment_config.yaml` 驅動的一鍵對照實驗腳本（支援 `--dry_run`、`--auto_download`、`--model_name_or_path`、`--run_tag`），並於報表自動寫入硬體與套件環境指紋。
    - `open-r1/scripts/generate_math_dataset.py`：確定性數學題庫生成器（10 大題型、嚴格零重疊，Train 200 題 + Eval 100 題），已預先生成並附在 `open-r1/datas/math_200/train.jsonl` 與 `open-r1/datas/eval_100.jsonl`。
 
 ---
 
-## 2. 環境建置（Windows / RTX 4060 8GB 實測版本）
+## 2. 環境建置（Windows 11 / 跨 CUDA GPU 實測版本）
 
-本機實際測試通過的套件版本如下（`openr1_venv/` 與 `models/` 已被 `.gitignore` 排除，clone 後需自行建立）：
+本機實際測試通過的套件版本集中鎖定在 **`open-r1/experiment_config.yaml`** 的 `environment` 區段（`openr1_venv/` 與 `models/` 已被 `.gitignore` 排除，clone 後需建立）：
 
-- **Python**: `3.11.9`
-- **PyTorch**: `2.5.1+cu124`
-- **核心套件**:
-  - `transformers==4.50.0`
-  - `trl==0.16.0`
-  - `peft==0.22.0`
-  - `accelerate==1.4.0`
-  - `datasets==3.6.0`
-  - `math-verify==0.5.2`
-  - `latex2sympy2_extended==1.0.6`
-  - `huggingface_hub==0.36.2`
-  - `safetensors==0.8.0`
-  - `tensorboard==2.21.0`
+### 方法 A（推薦）：Windows 11 一鍵建置與驗證
 
-> **注意（Windows 請勿執行 `pip install -e .`）**：`open-r1/setup.py` 綁定了僅支援 Linux 的 `deepspeed==0.15.4`、`liger_kernel==0.5.3`、`vllm==0.7.2` 與 `bitsandbytes`，在 Windows 上直接 `pip install -e .` 會失敗。請依下方指令手動安裝，並透過 `PYTHONPATH=src` 執行程式。
+```powershell
+cd open-r1
+powershell -ExecutionPolicy Bypass -File scripts\setup_win11.ps1
+```
 
-### Step 1：建立虛擬環境與安裝套件（PowerShell）
+腳本會自動檢查 Python 3.11、建立 `openr1_venv`、依 `experiment_config.yaml` 安裝鎖定版本的 CUDA PyTorch 與全部核心套件（不會執行 `pip install -e .`），並執行 `--check --strict` 驗證環境與 GPU。
+
+> 若組員使用 **RTX 50 系列（Blackwell, CC 12.0）**，請先將 `experiment_config.yaml` 的 `torch_version` 與 `torch_cuda_index_url` 改為支援 CUDA 12.8 (`cu128`) 的 PyTorch 2.7+ 後再執行 `setup_win11.ps1`。
+
+### 檢查現有環境是否與團隊一致
+
+```powershell
+cd open-r1
+$env:PYTHONPATH = "src"
+.\openr1_venv\Scripts\python.exe -m open_r1.experiment_config --check --strict
+```
+
+若只要印出修復指令而不中斷，可省略 `--strict`，或加上 `--print-setup` 印出完整 PowerShell 安裝指令。
+
+### 跨 CUDA GPU 自動相容規則
+
+`experiment_config.py` 在執行前會自動偵測本機顯示卡的 Compute Capability 與 VRAM：
+
+| 偵測項目 | 自動適配行為 |
+|---|---|
+| **Precision (`auto`)** | Ampere / Ada / Blackwell (`CC >= 8.0`) 用 `bf16`；Turing / Volta (`CC 7.x`，如 RTX 2060 / GTX 1660) 自動降級為 `fp16`；無 CUDA 退回 `fp32`。 |
+| **Attention (`auto`)** | Windows 下固定使用 PyTorch 內建 `sdpa`（Linux 且有 `flash_attn` + `CC >= 8.0` 才啟用 `flash_attention_2`）。 |
+| **VRAM Profile (`auto`)** | 依顯存自動歸類為 `vram_6gb` / `vram_8gb` / `vram_12gb` / `vram_16gb` / `vram_24gb_plus`，自動調整評測 `eval.batch_size` 與 `gradient_checkpointing`。 |
+| **公平對照鎖定** | `hardware.auto_adjust_training_hparams` 預設為 `false`，確保不同顯卡組員跑出的 `num_generations`、`max_completion_length`、`batch_size` 完全一致；若 VRAM 不足 6GB 想自動縮減生成參數，可於 YAML 改為 `true`。 |
+
+### 方法 B：手動建置虛擬環境（PowerShell）
+
+> **注意（Windows 請勿執行 `pip install -e .`）**：`open-r1/setup.py` 綁定了僅支援 Linux 的 `deepspeed==0.15.4`、`liger_kernel==0.5.3`、`vllm==0.7.2` 與 `bitsandbytes`，在 Windows 上直接 `pip install -e .` 會失敗。請依 `experiment_config.yaml` 鎖定版本手動安裝：
 
 ```powershell
 cd open-r1
@@ -72,12 +93,13 @@ python -m venv openr1_venv
   latex2sympy2_extended==1.0.6 `
   huggingface-hub==0.36.2 `
   safetensors==0.8.0 `
-  tensorboard==2.21.0
+  tensorboard==2.21.0 `
+  pyyaml==6.0.4
 ```
 
 ### Step 2：下載基礎模型
 
-`open-r1/recipes/local_rtx4060_gpg_cooldown.yaml` 預設讀取本地路徑 `models/Qwen2.5-0.5B-Instruct`，請先下載至該目錄：
+`open-r1/experiment_config.yaml` 預設讀取本地路徑 `models/Qwen2.5-0.5B-Instruct`（也可於執行 `compare_gpg_vs_cooldown.py` 時加上 `--auto_download` 自動抓取）：
 
 ```powershell
 .\openr1_venv\Scripts\huggingface-cli.exe download Qwen/Qwen2.5-0.5B-Instruct `
@@ -88,60 +110,46 @@ python -m venv openr1_venv
 
 ## 3. 啟動訓練方式
 
-所有訓練與腳本皆於 **`GPG/open-r1` 目錄** 執行，並需先設定環境變數：
+所有訓練與腳本皆於 **`GPG/open-r1` 目錄** 執行（執行集中設定模組時會自動補齊 `PYTHONPATH` 與 `PYTHONUTF8=1`）：
 
-- **PowerShell (Windows)**：
-  ```powershell
-  cd open-r1
-  $env:PYTHONPATH = "src"
-  $env:PYTHONUTF8 = "1"
-  ```
-- **Bash (Linux / WSL)**：
-  ```bash
-  cd open-r1
-  export PYTHONPATH=src
-  export PYTHONUTF8=1
-  ```
+### 方法 1（推薦）：集中設定檔 + 一鍵對照實驗
 
-### 方法 1（推薦）：一鍵對照實驗（原版 GPG vs. Cooldown 改良版）
-
-直接執行 `scripts/compare_gpg_vs_cooldown.py`，腳本會自動確認題庫存在、依序跑完各組訓練，並於最後用 Greedy Decoding（`do_sample=False`, `max_new_tokens=256`）評測 `Base`、`GPG 原版` 與 `GPG + Uniform Cooldown`：
+所有實驗參數皆在 `open-r1/experiment_config.yaml` 修改；要測試不同模型或超參數，只需修改 `model:` 與 `experiments.run_tag`（以免覆蓋舊報告），並先用 `--dry_run` 檢查實際解析結果：
 
 ```powershell
-# 預設跑 200 steps（約 1 full epoch），cooldown_steps=20
-.\openr1_venv\Scripts\python.exe scripts/compare_gpg_vs_cooldown.py --max_steps 200
+cd open-r1
 
-# 可自訂冷卻步數，或加上 --include_safesoft 額外多跑一組 Safe-Soft + Cooldown
-.\openr1_venv\Scripts\python.exe scripts/compare_gpg_vs_cooldown.py --max_steps 200 --cooldown_steps 20 --include_safesoft
+# 1. 先做 dry-run，確認 GPU 偵測、套件版本、輸出路徑皆正確（不會啟動訓練）
+.\openr1_venv\Scripts\python.exe scripts\compare_gpg_vs_cooldown.py --dry_run
+
+# 2. 依 experiment_config.yaml 執行完整對照實驗
+.\openr1_venv\Scripts\python.exe scripts\compare_gpg_vs_cooldown.py
+
+# 3. 不改 YAML 臨時換模型測試（若本地沒有會自動從 --model_name_or_path 或 hf_repo_id 下載）
+.\openr1_venv\Scripts\python.exe scripts\compare_gpg_vs_cooldown.py `
+  --model_name_or_path models/Qwen2.5-1.5B-Instruct `
+  --run_tag qwen15b_200 `
+  --include_safesoft
 ```
 
-> 若目標 `output_dir` 內已存在 `trainer_state.json`（且 `global_step >= max_steps`）與 `adapter_model.safetensors`，腳本會自動 `[SKIP]` 跳過訓練直接進入評測；若要重跑，請先刪除對應 `outputs/exp200_*` 資料夾。
+> 若目標 `output_dir` 內已存在 `trainer_state.json`（且 `global_step >= max_steps`）與 `adapter_model.safetensors`，腳本會自動 `[SKIP]` 跳過訓練直接進入評測；若要重跑，請先刪除對應 `outputs/exp*` 資料夾或更改 `run_tag`。
 
 ### 方法 2：單獨啟動訓練（直接呼叫 `gpg.py`）
 
-1. **啟動 GPG + Uniform Cooldown（使用 YAML 預設設定）**：
-   ```powershell
-   .\openr1_venv\Scripts\python.exe src/open_r1/gpg.py `
-     --config recipes/local_rtx4060_gpg_cooldown.yaml
-   ```
+`gpg.py` 已支援直接傳入集中設定檔 `--config experiment_config.yaml`（會自動轉為相容的平坦 TRL YAML 並套用硬體適配），也維持相容舊版 `recipes/*.yaml`：
 
-2. **啟動 GPG 原版 Baseline（關閉動態權重與冷卻）**：
-   ```powershell
-   .\openr1_venv\Scripts\python.exe src/open_r1/gpg.py `
-     --config recipes/local_rtx4060_gpg_cooldown.yaml `
-     --output_dir outputs/exp200_baseline_gpg `
-     --weighted_sample False
-   ```
+```powershell
+$env:PYTHONPATH = "src"; $env:PYTHONUTF8 = "1"
 
-3. **啟動 Safe-Soft + Cooldown 實驗**：
-   ```powershell
-   .\openr1_venv\Scripts\python.exe src/open_r1/gpg.py `
-     --config recipes/local_rtx4060_gpg_cooldown.yaml `
-     --output_dir outputs/exp200_safesoft_cooldown `
-     --weighted_sample True `
-     --sample_strategy soft `
-     --cooldown_steps 20
-   ```
+# 使用集中設定檔啟動單組訓練
+.\openr1_venv\Scripts\python.exe src/open_r1/gpg.py --config experiment_config.yaml
+
+# 覆蓋單一參數啟動 Baseline
+.\openr1_venv\Scripts\python.exe src/open_r1/gpg.py `
+  --config experiment_config.yaml `
+  --output_dir outputs/exp200_baseline_gpg `
+  --weighted_sample False
+```
 
 ### 方法 3：重新生成數學資料集（選用）
 

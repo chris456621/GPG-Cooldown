@@ -1,0 +1,217 @@
+# ==============================================================================
+# GPG + Cooldown 統一實驗設定與 Windows 11 / CUDA GPU 環境管理檔
+# ------------------------------------------------------------------------------
+# 組員只需修改本檔案，即可切換模型、資料集、超參數與對照實驗組別，
+# 並確保所有人在 Windows 11 上使用一致的套件版本與公平的訓練基準。
+# ==============================================================================
+
+schema_version: 1
+
+# ------------------------------------------------------------------------------
+# 1. Windows 11 套件與環境變數鎖定（Single Source of Truth）
+# ------------------------------------------------------------------------------
+environment:
+  target_os: "Windows-11"
+  python_minor: "3.11"
+  torch_version: "2.5.1"
+  # 註：RTX 50 系列 (Blackwell, CC 12.0) 需改用 CUDA 12.8 / PyTorch 2.7+ (cu128)
+  torch_cuda_index_url: "https://download.pytorch.org/whl/cu124"
+  # true：套件或 Python/PyTorch 版本不符時直接中斷；false：印出醒目警告與修復指令
+  strict_env_check: false
+  packages:
+    transformers: "4.50.0"
+    trl: "0.16.0"
+    peft: "0.22.0"
+    accelerate: "1.4.0"
+    datasets: "3.6.0"
+    math-verify: "0.5.2"
+    latex2sympy2-extended: "1.0.6"
+    huggingface-hub: "0.36.2"
+    safetensors: "0.8.0"
+    tensorboard: "2.21.0"
+    pyyaml: "6.0.4"
+  # 注意：Windows PyTorch 2.5.1 不支援 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True，請勿加入
+  env_vars:
+    PYTHONPATH: "src"
+    PYTHONUTF8: "1"
+    TOKENIZERS_PARALLELISM: "false"
+
+# ------------------------------------------------------------------------------
+# 2. CUDA GPU 硬體偵測與跨顯示卡相容設定
+# ------------------------------------------------------------------------------
+hardware:
+  # 指定使用的 GPU 編號（例如 "0"），null 表示依系統預設
+  cuda_visible_devices: null
+  # auto | bf16 | fp16 | fp32
+  # auto：Compute Capability >= 8.0（RTX 30/40/50、A100）用 bf16；CC 7.x（RTX 20/GTX 16）用 fp16；無 CUDA 用 fp32
+  precision: "auto"
+  # auto | sdpa | flash_attention_2 | eager
+  # auto：Windows 下固定用 PyTorch 內建 sdpa；Linux 且已安裝 flash_attn + CC>=8.0 才選 flash_attention_2
+  attn_implementation: "auto"
+  # Windows 不支援 vLLM，程式層會在 Windows 上強制維持 false
+  use_vllm: false
+  # auto | vram_6gb | vram_8gb | vram_12gb | vram_16gb | vram_24gb_plus | manual
+  gpu_profile: "auto"
+  # 預設 false：鎖定組員之間的訓練超參數以確保實驗公平可比較，只自動適配 precision / attn / eval.batch_size / gradient_checkpointing
+  # 設為 true 時：才依偵測到的 VRAM 自動套用下方 gpu_profiles 內的 training_overrides
+  auto_adjust_training_hparams: false
+  gpu_profiles:
+    vram_6gb:
+      eval_batch_size: 4
+      gradient_checkpointing: true
+      training_overrides:
+        num_generations: 4
+        per_device_train_batch_size: 4
+        max_completion_length: 160
+    vram_8gb:
+      eval_batch_size: 16
+      gradient_checkpointing: true
+      training_overrides:
+        num_generations: 8
+        per_device_train_batch_size: 8
+        max_completion_length: 192
+    vram_12gb:
+      eval_batch_size: 24
+      gradient_checkpointing: true
+      training_overrides:
+        num_generations: 8
+        per_device_train_batch_size: 8
+        max_completion_length: 256
+    vram_16gb:
+      eval_batch_size: 32
+      gradient_checkpointing: true
+      training_overrides:
+        num_generations: 8
+        per_device_train_batch_size: 8
+        max_completion_length: 256
+    vram_24gb_plus:
+      eval_batch_size: 32
+      gradient_checkpointing: false
+      training_overrides:
+        num_generations: 8
+        per_device_train_batch_size: 8
+        max_completion_length: 256
+
+# ------------------------------------------------------------------------------
+# 3. 基礎模型、LoRA 與量化設定（換模型改這裡即可）
+# ------------------------------------------------------------------------------
+model:
+  name_or_path: "models/Qwen2.5-1.5B-Instruct"
+  # 當本機路徑不存在且啟用 --auto_download 時，從此 HuggingFace Repo 下載至 name_or_path
+  hf_repo_id: "Qwen/Qwen2.5-1.5B-Instruct"
+  revision: "main"
+  trust_remote_code: false
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules:
+      - "q_proj"
+      - "v_proj"
+  quantization:
+    # 若需在 8GB 上跑 3B 等較大模型，需另裝 Windows 相容 bitsandbytes 並設為 true
+    load_in_4bit: false
+    bnb_4bit_quant_type: "nf4"
+    use_bnb_nested_quant: false
+
+# ------------------------------------------------------------------------------
+# 4. 資料集設定
+# ------------------------------------------------------------------------------
+dataset:
+  name: "datas/math_200"
+  train_file: "datas/math_200/train.jsonl"
+  eval_file: "datas/eval_100.jsonl"
+  auto_generate: true
+  train_per_cat: 20
+  eval_per_cat: 10
+  seed: 2026
+  system_prompt: "You are a helpful math assistant. Solve the problem step by step and put the final answer inside \\boxed{}."
+
+# ------------------------------------------------------------------------------
+# 5. 訓練排程與生成參數（預設對齊已驗證的 RTX 4060 200-step 基準）
+# ------------------------------------------------------------------------------
+training:
+  seed: 42
+  max_steps: 200
+  num_train_epochs: 3
+  num_generations: 4
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+  learning_rate: 5.0e-05
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  max_prompt_length: 256
+  max_completion_length: 192
+  logging_steps: 1
+  logging_first_step: true
+  logging_strategy: "steps"
+  log_completions: false
+  log_level: "info"
+  save_strategy: "steps"
+  save_steps: 50
+  save_total_limit: 2
+  report_to:
+    - "tensorboard"
+  push_to_hub: false
+  do_eval: false
+  eval_strategy: "no"
+  overwrite_output_dir: true
+
+# ------------------------------------------------------------------------------
+# 6. GPG 與 Cooldown 演算法參數
+# ------------------------------------------------------------------------------
+gpg:
+  reward_funcs:
+    - "accuracy"
+  reward_weights:
+    - 1.0
+  scale_rewards: false
+  min_inverse_alpha: 0.0
+  weighted_sample: true
+  sample_strategy: "uniform"
+  cooldown_steps: 20
+  scale_batch: false
+  adjust_lr: false
+  adjust_gd: false
+
+# ------------------------------------------------------------------------------
+# 7. 確定性評測參數
+# ------------------------------------------------------------------------------
+evaluation:
+  do_sample: false
+  max_new_tokens: 256
+  # auto：依偵測到的 gpu_profile 自動選取 eval_batch_size；亦可直接填入整數（如 16）
+  batch_size: 8
+
+# ------------------------------------------------------------------------------
+# 8. 一鍵對照實驗組別（換模型建議同步修改 run_tag 以免覆蓋舊報告）
+# ------------------------------------------------------------------------------
+experiments:
+  run_tag: "qwen15b_200"
+  output_dir_template: "outputs/exp{run_tag}_{slug}"
+  report_md: "outputs/comparison_report_{run_tag}.md"
+  report_json: "outputs/comparison_report_{run_tag}.json"
+  groups:
+    - slug: "baseline_gpg"
+      label: "GPG 原版 (Uniform)"
+      enabled: true
+      overrides:
+        weighted_sample: false
+    - slug: "uniform_cooldown"
+      label: "GPG + Uniform Cooldown (Ours, cd={cooldown_steps})"
+      enabled: true
+      overrides:
+        weighted_sample: true
+        sample_strategy: "uniform"
+        cooldown_steps: "{cooldown_steps}"
+    - slug: "safesoft_cooldown"
+      label: "GPG + Safe-Soft Cooldown (Ours-Soft, cd={cooldown_steps})"
+      enabled: false
+      overrides:
+        weighted_sample: true
+        sample_strategy: "soft"
+        cooldown_steps: "{cooldown_steps}"

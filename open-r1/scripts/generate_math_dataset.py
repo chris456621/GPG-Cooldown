@@ -185,7 +185,13 @@ GENERATORS = [
 ]
 
 
-def generate_datasets(train_per_cat: int = 20, eval_per_cat: int = 10, seed: int = 2026):
+def generate_datasets(
+    train_per_cat: int = 20,
+    eval_per_cat: int = 10,
+    seed: int = 2026,
+    train_file: Path | str | None = None,
+    eval_file: Path | str | None = None,
+):
     rng = random.Random(seed)
     seen_problems: set[str] = set()
     train_items: list[dict] = []
@@ -209,19 +215,50 @@ def generate_datasets(train_per_cat: int = 20, eval_per_cat: int = 10, seed: int
     assert len(eval_items) == eval_per_cat * len(GENERATORS)
     assert len({x["problem"] for x in train_items} & {x["problem"] for x in eval_items}) == 0
 
-    TRAIN_DIR.mkdir(parents=True, exist_ok=True)
-    train_file = TRAIN_DIR / "train.jsonl"
-    with open(train_file, "w", encoding="utf-8") as f:
+    target_train = Path(train_file) if train_file is not None else (TRAIN_DIR / "train.jsonl")
+    target_eval = Path(eval_file) if eval_file is not None else EVAL_PATH
+    target_train.parent.mkdir(parents=True, exist_ok=True)
+    target_eval.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(target_train, "w", encoding="utf-8") as f:
         for row in train_items:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    with open(EVAL_PATH, "w", encoding="utf-8") as f:
+    with open(target_eval, "w", encoding="utf-8") as f:
         for row in eval_items:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print(f"已生成 Train ({len(train_items)} 題): {train_file}")
-    print(f"已生成 Eval  ({len(eval_items)} 題): {EVAL_PATH}")
+    print(f"已生成 Train ({len(train_items)} 題): {target_train}")
+    print(f"已生成 Eval  ({len(eval_items)} 題): {target_eval}")
 
 
 if __name__ == "__main__":
-    generate_datasets()
+    import argparse
+
+    import yaml
+
+    parser = argparse.ArgumentParser(description="確定性數學題庫生成器")
+    parser.add_argument("--config", type=str, default=None, help="選用：讀取集中設定檔的 dataset 區段")
+    args = parser.parse_args()
+
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.is_absolute():
+            cfg_path = ROOT / cfg_path
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        ds = raw.get("dataset", {})
+        tr_p = Path(ds.get("train_file", TRAIN_DIR / "train.jsonl"))
+        ev_p = Path(ds.get("eval_file", EVAL_PATH))
+        if not tr_p.is_absolute():
+            tr_p = ROOT / tr_p
+        if not ev_p.is_absolute():
+            ev_p = ROOT / ev_p
+        generate_datasets(
+            train_per_cat=int(ds.get("train_per_cat", 20)),
+            eval_per_cat=int(ds.get("eval_per_cat", 10)),
+            seed=int(ds.get("seed", 2026)),
+            train_file=tr_p,
+            eval_file=ev_p,
+        )
+    else:
+        generate_datasets()

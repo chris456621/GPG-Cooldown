@@ -28,7 +28,8 @@ from open_r1.rewards import get_reward_funcs
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
-from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config
+from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config, get_quantization_config
+from open_r1.experiment_config import prepare_gpg_cli_args
 from open_r1.gpg_trainer import GPGTrainer
 from open_r1.utils.data_utils import custom_loading_dataset
 from transformers import TrainerCallback
@@ -131,6 +132,9 @@ def main(script_args, training_args, model_args):
         torch_dtype=torch_dtype,
         use_cache=False if training_args.gradient_checkpointing else True,
     )
+    quantization_config = get_quantization_config(model_args)
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
     training_args.model_init_kwargs = model_kwargs
 
     #############################
@@ -221,6 +225,7 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
+    sys.argv[1:] = prepare_gpg_cli_args(sys.argv[1:])
     parser = TrlParser((GRPOScriptArguments, GPGConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
