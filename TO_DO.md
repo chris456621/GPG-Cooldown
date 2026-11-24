@@ -11,18 +11,26 @@
 - **訓練超參數**：`max_steps=200`、`G=4`、`per_device_train_batch_size=4`、`gradient_accumulation_steps=2`（= 2 題/step）、`L=192`、`learning_rate=5e-5`、`LoRA r=8, alpha=16 (q_proj, v_proj)`、`seed=42`、`min_inverse_alpha=0.0`
 - **精度**：NVIDIA CUDA (RTX 4060 / 3060 / 3090) 自動走原生 `bf16`；MacBook Pro M1 自動走 MPS `float32`（**M1 耗時不與 CUDA 橫比**）。
 
-### 組員前置作業（只需做一次）
+### 組員完整操作流程（照順序做）
 
-- **Windows 11（4060 / 3060 / 3090）**：
-  ```powershell
-  cd open-r1
-  powershell -ExecutionPolicy Bypass -File scripts\setup_win11.ps1
-  ```
-- **macOS Apple Silicon（MacBook Pro M1）**：
-  ```bash
-  cd open-r1
-  bash scripts/setup_macos_m1.sh
-  ```
+1. **同步最新程式碼**：先 `git clone`（首次）或 `git pull` 拉取最新 `main`。
+2. **一鍵建置與驗證環境（只需做一次）**：
+   - **Windows 11（4060 / 3060 / 3090）**：
+     ```powershell
+     cd open-r1
+     powershell -ExecutionPolicy Bypass -File scripts\setup_win11.ps1
+     .\openr1_venv\Scripts\python.exe -m open_r1.experiment_config --check --strict
+     ```
+   - **macOS Apple Silicon（MacBook Pro M1）**：
+     ```bash
+     cd open-r1
+     bash scripts/setup_macos_m1.sh
+     ./openr1_venv/bin/python -m open_r1.experiment_config --check --strict
+     ```
+3. **開跑前先 Dry-Run 檢查**：執行對應實驗指令時先加上 `--dry_run`（確認 GPU 偵測、模型路徑與 `run_tag` 正確、不會開始訓練）。
+4. **依所屬機器複製第 2 節指令開跑**：切勿自行修改控制變因（如 `learning_rate`、`lora.r`、`dataset.seed`）；遇到需要 `--auto_download` 的組別會自動抓模型，不要把 `models/` 或 `outputs/exp*/` checkpoint 推上 Git。
+5. **將實驗報告推回 GitHub**（詳見第 3 節）：只推 `open-r1/outputs/comparison_report_<run_tag>.md` 與 `.json`。
+6. **總彙整**：全員推完後 `git pull`，執行 `scripts/aggregate_reports.py` 產出總表並推回 repo。
 
 ---
 
@@ -174,19 +182,44 @@
 
 ---
 
-## 3. 收回結果並自動產生總表
+## 3. 交回報告與自動產生總表
 
-每位組員只需把跑完的 **`open-r1/outputs/comparison_report_<run_tag>.json`**（與 `.md`）放進同一個 `open-r1/outputs/` 資料夾，執行：
+### Step A：組員將實驗報告推上 GitHub（於 repo 根目錄 `GPG/` 執行）
+
+`open-r1/.gitignore` 已設定排除訓練 checkpoint（`outputs/exp*/`）與本地模型（`models/`），**只放行報告檔**，組員可直接把跑完的 `comparison_report_<run_tag>.*` 推上來：
+
+```bash
+git pull --rebase
+git add open-r1/outputs/comparison_report_<run_tag>.md open-r1/outputs/comparison_report_<run_tag>.json
+git commit -m "新增 <run_tag> 實驗報告"
+git push
+```
+
+> ⚠️ **注意**：切勿強制 `git add -f models/` 或 `git add -f open-r1/outputs/exp*/`，單檔超過 100 MB 會造成整個 repo push 失敗。
+
+### Step B：拉回所有報告並自動產生總表（於 `open-r1/` 目錄執行）
+
+待組員都把報告 push 上 `main` 後，先執行 `git pull` 拉齊全部 `open-r1/outputs/comparison_report_*.json`，再執行彙整腳本：
 
 ```powershell
 # Windows 11
+git pull
 .\openr1_venv\Scripts\python.exe scripts\aggregate_reports.py
 ```
 ```bash
 # macOS M1
+git pull
 ./openr1_venv/bin/python scripts/aggregate_reports.py
 ```
 
-會自動檢查控制變因一致性，並在 `open-r1/outputs/` 產出：
+腳本會自動檢查各報告的控制變因一致性（並提示 M1 MPS 與 CUDA 耗時不可橫比），在 `open-r1/outputs/` 產出：
 - `summary_all_experiments.md`（Markdown 總比較表）
 - `summary_all_experiments.csv`（UTF-8 BOM，Excel 直接開啟不亂碼）
+
+產生後即可一併推送總表存檔：
+
+```bash
+git add open-r1/outputs/summary_all_experiments.md open-r1/outputs/summary_all_experiments.csv
+git commit -m "彙整全員實驗結果總表"
+git push
+```
