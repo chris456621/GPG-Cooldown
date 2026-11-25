@@ -163,6 +163,7 @@ def parse_train_logs(output_dir: Path) -> dict[str, Any]:
     hard = [x.get("num_hard_problem", 0.0) for x in logs]
     inv_a = [x.get("inverse_alpha", 0.0) for x in logs]
     grad_nz = sum(1 for x in logs if x.get("grad_norm", 0.0) > 0)
+    peak_vram = max((x.get("peak_vram_gb", 0.0) for x in logs), default=0.0)
     n = len(rewards)
     q = max(1, n // 4)
 
@@ -179,6 +180,8 @@ def parse_train_logs(output_dir: Path) -> dict[str, Any]:
         "avg_hard_per_step": round(avg(hard), 3),
         "avg_valid_grad_ratio": round(avg(inv_a), 3),
         "nonzero_grad_steps": f"{grad_nz}/{n}",
+        "peak_vram_gb": round(peak_vram, 2),
+        "sec_per_step": round(res.get("train_runtime", 0.0) / n, 2) if n else 0.0,
         "reward_curve": rewards,
     }
 
@@ -332,14 +335,15 @@ def render_comparison_report_md(
         "",
         "## 1. 訓練過程指標比較",
         "",
-        "| 組別 | 耗時 (s) | 全程平均 Reward | 前 1/4 Reward | 後 1/4 Reward | 平均全對題/步 (`easy`) | 有效梯度比 (`inv_alpha`) | 非零梯度步數 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| 組別 | 耗時 (s) | 全程平均 Reward | 前 1/4 Reward | 後 1/4 Reward | 平均全對題/步 (`easy`) | 有效梯度比 (`inv_alpha`) | 非零梯度步數 | 每步秒數 | 峰值顯存 (GB) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, log in train_logs.items():
+        peak = log.get("peak_vram_gb") or "-"
         lines.append(
             f"| {name} | {log['runtime_sec']} | {log['avg_reward']:.4f} | {log['first_quarter_reward']:.4f} "
             f"| {log['last_quarter_reward']:.4f} | {log['avg_easy_per_step']:.3f} | {log['avg_valid_grad_ratio']:.3f} "
-            f"| {log['nonzero_grad_steps']} |"
+            f"| {log['nonzero_grad_steps']} | {log.get('sec_per_step', '-')} | {peak} |"
         )
 
     lines += [
@@ -366,6 +370,10 @@ def render_comparison_report_md(
         "```",
     ]
     return "\n".join(lines) + "\n"
+
+
+# Qwen2 / Qwen3 / Llama 家族的全部線性層（--lora_target_modules all-linear 時展開）
+ALL_LINEAR_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
 
 def _parse_bool_flag(raw: str) -> bool:
@@ -415,6 +423,25 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
         overrides.setdefault("hardware", {})["precision"] = args.precision
     if args.gpu_profile:
         overrides.setdefault("hardware", {})["gpu_profile"] = args.gpu_profile
+    if args.load_in_4bit is not None:
+        overrides.setdefault("model", {}).setdefault("quantization", {})["load_in_4bit"] = args.load_in_4bit
+    if args.lora_r is not None:
+        overrides.setdefault("model", {}).setdefault("lora", {})["r"] = args.lora_r
+    if args.lora_alpha is not None:
+        overrides.setdefault("model", {}).setdefault("lora", {})["alpha"] = args.lora_alpha
+    if args.lora_target_modules:
+        raw = args.lora_target_modules.strip()
+        if raw.lower() == "all-linear":
+            modules = list(ALL_LINEAR_MODULES)
+        else:
+            modules = [m.strip() for m in raw.split(",") if m.strip()]
+        overrides.setdefault("model", {}).setdefault("lora", {})["target_modules"] = modules
+    if args.learning_rate is not None:
+        overrides.setdefault("training", {})["learning_rate"] = args.learning_rate
+    if args.eval_max_new_tokens is not None:
+        overrides.setdefault("evaluation", {})["max_new_tokens"] = args.eval_max_new_tokens
+    if args.eval_batch_size is not None:
+        overrides.setdefault("evaluation", {})["batch_size"] = args.eval_batch_size
     return overrides
 
 
@@ -444,6 +471,15 @@ def main() -> None:
     parser.add_argument("--strict_env", action="store_true", help="套件或 Python/PyTorch 版本不符時直接中止")
     parser.add_argument("--auto_download", action="store_true", help="本地模型不存在時自動由 hf_repo_id 下載")
     parser.add_argument("--dry_run", action="store_true", help="僅檢查環境與顯示實際執行計畫，不訓練不評測")
+    parser.add_argument("--load_in_4bit", type=_parse_bool_flag, default=None, help="覆蓋 model.quantization.load_in_4bit（QLoRA，需 bitsandbytes）")
+    parser.add_argument("--lora_r", type=int, default=None, help="覆蓋 LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=None, help="覆蓋 LoRA alpha")
+    parser.add_argument("--lora_target_modules", type=str, default=None, help="逗號分隔的 LoRA 目標層，或 all-linear")
+    parser.add_argument("--learning_rate", type=float, default=None, help="覆蓋 training.learning_rate")
+    parser.add_argument("--eval_max_new_tokens", type=int, default=None, help="覆蓋評測時的 max_new_tokens（避免長推導被截斷）")
+    parser.add_argument("--eval_batch_size", type=int, default=None, help="覆蓋評測 batch size")
+    parser.add_argument("--eval_only", action="store_true", help="不訓練，只評測已存在的 adapter（例如換 max_new_tokens 重評）")
+    parser.add_argument("--report_suffix", type=str, default="", help="報告檔名後綴，重評時避免覆蓋原報告（例如 _eval512）")
     args = parser.parse_args()
 
     cli_overrides = _build_cli_overrides(args)
@@ -468,11 +504,16 @@ def main() -> None:
     report_md_path = _resolve_root_path(str(exp_cfg.get("report_md", f"outputs/comparison_report_{run_tag}.md")).format(run_tag=run_tag))
     report_json_path = _resolve_root_path(str(exp_cfg.get("report_json", f"outputs/comparison_report_{run_tag}.json")).format(run_tag=run_tag))
     max_steps = int(resolved["training"]["max_steps"])
+    if args.report_suffix:
+        report_md_path = report_md_path.with_name(report_md_path.stem + args.report_suffix + report_md_path.suffix)
+        report_json_path = report_json_path.with_name(report_json_path.stem + args.report_suffix + report_json_path.suffix)
 
     if args.dry_run:
         print("\n=== [DRY RUN] 預計執行計畫（不會修改現有 outputs 或開始訓練） ===")
         print(f"Model      : {resolved['model']['name_or_path']} (LoRA={resolved['model']['lora']['enabled']}, 4bit={resolved['model']['quantization']['load_in_4bit']})")
         print(f"Dataset    : {resolved['dataset']['train_file']} / {resolved['dataset']['eval_file']}")
+        print(f"LoRA       : r={resolved['model']['lora']['r']}, alpha={resolved['model']['lora']['alpha']}, targets={resolved['model']['lora']['target_modules']}")
+        print(f"LR / Eval  : lr={resolved['training']['learning_rate']}, eval_max_new_tokens={resolved['evaluation']['max_new_tokens']}, eval_bs={resolved['evaluation']['batch_size']}")
         print(f"Report MD  : {report_md_path}")
         print(f"Report JSON: {report_json_path}")
         for grp in groups:
@@ -493,6 +534,11 @@ def main() -> None:
     env_snapshot = build_env_snapshot(resolved)
 
     for grp in groups:
+        if args.eval_only:
+            if not (grp["output_dir"] / "adapter_model.safetensors").exists():
+                raise FileNotFoundError(f"--eval_only 需要已訓練好的 adapter，但找不到: {grp['output_dir']}")
+            print(f"[EVAL-ONLY] 略過訓練 {grp['label']}，直接評測 {grp['output_dir']}")
+            continue
         trl_dict = build_trl_config_dict(resolved, grp["overrides"])
         trl_dict["model_name_or_path"] = str(model_source)
         run_training_if_needed(

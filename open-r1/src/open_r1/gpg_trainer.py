@@ -741,6 +741,10 @@ class GPGTrainer(GRPOTrainer):
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
         logs = {**logs, **metrics}
+        # 極限測試用：記錄訓練至今的峰值顯存（GB），報告與 stress_test_limits.py 會讀取
+        if mode == "train" and torch.cuda.is_available():
+            logs["peak_vram_gb"] = round(torch.cuda.max_memory_allocated() / 1024**3, 2)
+            logs["peak_vram_reserved_gb"] = round(torch.cuda.max_memory_reserved() / 1024**3, 2)
         if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
             Trainer.log(self, logs, start_time)
             # super().log(logs, start_time)
@@ -769,6 +773,25 @@ class GPGTrainer(GRPOTrainer):
             with open(mastered_path, "w", encoding="utf-8") as file:
                 json.dump(dict(self.consecutive_mastered), file, ensure_ascii=False, indent=4)
             print(f"data_weight 已成功保存到 {file_path}")
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """續訓時（例如 Colab 斷線後重跑）一併還原抽樣權重與冷卻狀態，避免冷卻中的題目被全部解鎖。"""
+        import json
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+        weight_path = os.path.join(resume_from_checkpoint, 'data_weight.json')
+        eligible_path = os.path.join(resume_from_checkpoint, 'next_eligible_step.json')
+        mastered_path = os.path.join(resume_from_checkpoint, 'consecutive_mastered.json')
+        if os.path.isfile(weight_path):
+            with open(weight_path, encoding="utf-8") as file:
+                for mode, weights in json.load(file).items():
+                    self.data_weight[mode] = defaultdict(list, weights)
+        if os.path.isfile(eligible_path):
+            with open(eligible_path, encoding="utf-8") as file:
+                self.next_eligible_step = defaultdict(int, {k: int(v) for k, v in json.load(file).items()})
+        if os.path.isfile(mastered_path):
+            with open(mastered_path, encoding="utf-8") as file:
+                self.consecutive_mastered = defaultdict(int, {k: int(v) for k, v in json.load(file).items()})
+        print(f"[RESUME] 已從 {resume_from_checkpoint} 還原冷卻狀態（{len(self.next_eligible_step)} 題）")
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
         # See _get_train_sampler for an explanation of the sampler.
@@ -845,4 +868,4 @@ def pad_sequence_to_length(tensors, max_seq_len, pad_token_id, left_pad=False):
     if tensors.shape[-1] >= max_seq_len:
         return tensors
     pad_tuple = (max_seq_len - tensors.shape[-1], 0) if left_pad else (0, max_seq_len - tensors.shape[-1])
-    return F.pad(tensors, pad_tuple, "constant", pad_token_id)
+    return F.pad(tensors, pad_tuple, "constant", pad_token_id)

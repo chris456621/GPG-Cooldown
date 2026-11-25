@@ -188,5 +188,7 @@ outputs/*
 !outputs/.gitkeep
 !outputs/comparison_report*.md
 !outputs/comparison_report*.json
+!outputs/stress_report*.md
+!outputs/stress_report*.json
 !outputs/summary_all_experiments.md
 !outputs/summary_all_experiments.csv

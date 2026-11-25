@@ -108,6 +108,29 @@ python -m venv openr1_venv
 
 ---
 
+### 方法 C：Google Colab（L4 / A100 40G）
+
+開啟 [`open-r1/notebooks/colab_gpg_cooldown.ipynb`](open-r1/notebooks/colab_gpg_cooldown.ipynb)，照順序執行即可。重點：
+
+- 程式碼與 `outputs/` 放在 Google Drive，斷線後重跑同一指令會從最後一個 checkpoint 續訓（冷卻狀態 `next_eligible_step.json` 會一併還原）。
+- 模型權重放 Colab 本機磁碟（`/content/models`），每個 session 重新下載。
+- Colab 沿用內建 PyTorch，環境檢查出現 `MISMATCH` 警告是預期的。
+- 大模型可用 4-bit QLoRA：`--load_in_4bit true`（例如 Qwen2.5-14B 在 A100 40G 上）。
+
+`compare_gpg_vs_cooldown.py` 另新增以下參數（皆可搭配 `--dry_run` 先檢查）：
+
+| 參數 | 用途 |
+|---|---|
+| `--load_in_4bit true/false` | 開關 4-bit 量化（QLoRA） |
+| `--lora_r` / `--lora_alpha` | LoRA rank 與 alpha |
+| `--lora_target_modules` | 逗號分隔的層名，或 `all-linear`（q/k/v/o/gate/up/down） |
+| `--learning_rate` | 學習率 |
+| `--eval_max_new_tokens` / `--eval_batch_size` | 評測生成長度與 batch size |
+| `--eval_only` | 不訓練，只評測已存在的 adapter |
+| `--report_suffix` | 報告檔名後綴，重評時不覆蓋原報告（例如 `_eval512`） |
+
+---
+
 ## 3. 啟動訓練方式
 
 所有訓練與腳本皆於 **`GPG/open-r1` 目錄** 執行（執行集中設定模組時會自動補齊 `PYTHONPATH` 與 `PYTHONUTF8=1`）：
