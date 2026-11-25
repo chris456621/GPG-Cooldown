@@ -134,7 +134,9 @@ def main(script_args, training_args, model_args):
     )
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
-        model_kwargs["quantization_config"] = quantization_config
+        # 以 dict 傳入：BitsAndBytesConfig 物件無法被 TensorBoard callback 序列化成 JSON（會在 on_train_begin 報錯），
+        # transformers 的 from_pretrained 會自動把 dict 轉回 BitsAndBytesConfig
+        model_kwargs["quantization_config"] = quantization_config.to_dict()
     training_args.model_init_kwargs = model_kwargs
 
     #############################
