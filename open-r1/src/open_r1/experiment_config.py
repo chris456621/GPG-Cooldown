@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib
 import importlib.metadata
 import importlib.util
 import os
@@ -14,7 +15,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import torch
 import yaml
 from packaging.version import Version
 
@@ -47,8 +47,13 @@ def _resolve_path_under_root(raw_path: str, root: Path = OPEN_R1_ROOT) -> Path:
 
 def detect_hardware(device_index: int = 0) -> dict[str, Any]:
     """偵測目前作業系統、Python、PyTorch/CUDA 或 Apple Silicon MPS 硬體資訊。"""
-    cuda_available = torch.cuda.is_available()
-    mps_backend = getattr(torch.backends, "mps", None)
+    try:
+        import torch
+    except ImportError:
+        torch = None  # type: ignore[assignment]
+
+    cuda_available = bool(torch is not None and torch.cuda.is_available())
+    mps_backend = getattr(torch.backends, "mps", None) if torch is not None else None
     mps_available = bool(mps_backend is not None and mps_backend.is_available())
     accelerator_backend = "cuda" if cuda_available else ("mps" if mps_available else "cpu")
 
@@ -57,7 +62,7 @@ def detect_hardware(device_index: int = 0) -> dict[str, Any]:
     free_vram_gb = 0.0
     cc: tuple[int, int] | None = None
     bf16_native = False
-    device_count = torch.cuda.device_count() if cuda_available else (1 if mps_available else 0)
+    device_count = torch.cuda.device_count() if (torch is not None and cuda_available) else (1 if mps_available else 0)
 
     if cuda_available and device_count > 0:
         idx = min(device_index, device_count - 1)
@@ -100,8 +105,8 @@ def detect_hardware(device_index: int = 0) -> dict[str, Any]:
         "os_release": os_release,
         "os_version": os_version,
         "python_version": platform.python_version(),
-        "torch_version": torch.__version__,
-        "cuda_version": getattr(torch.version, "cuda", None),
+        "torch_version": torch.__version__ if torch is not None else "NOT_INSTALLED",
+        "cuda_version": getattr(torch.version, "cuda", None) if torch is not None else None,
         "cuda_available": cuda_available,
         "mps_available": mps_available,
         "accelerator_backend": accelerator_backend,
@@ -279,17 +284,28 @@ def check_environment(cfg: dict[str, Any], hw: dict[str, Any], strict: bool = Fa
     torch_actual_raw = str(hw.get("torch_version", ""))
     torch_actual = _base_version(torch_actual_raw)
     if torch_expected:
-        ok = torch_actual == torch_expected
-        items.append(
-            {
-                "name": "torch",
-                "expected": torch_expected,
-                "actual": torch_actual_raw,
-                "status": "OK" if ok else "MISMATCH",
-            }
-        )
-        if not ok:
-            mismatches.append(f"torch 預期 {torch_expected}，目前為 {torch_actual_raw}")
+        if torch_actual_raw == "NOT_INSTALLED":
+            items.append(
+                {
+                    "name": "torch",
+                    "expected": torch_expected,
+                    "actual": "NOT_INSTALLED",
+                    "status": "MISSING",
+                }
+            )
+            mismatches.append(f"torch 尚未安裝（預期 {torch_expected}）")
+        else:
+            ok = torch_actual == torch_expected
+            items.append(
+                {
+                    "name": "torch",
+                    "expected": torch_expected,
+                    "actual": torch_actual_raw,
+                    "status": "OK" if ok else "MISMATCH",
+                }
+            )
+            if not ok:
+                mismatches.append(f"torch 預期 {torch_expected}，目前為 {torch_actual_raw}")
 
     has_accel = bool(
         hw.get("cuda_available")
@@ -765,6 +781,7 @@ def sync_win11_packages(cfg: dict[str, Any]) -> None:
         )
     if pkgs:
         subprocess.run([sys.executable, "-m", "pip", "install", *pkgs], check=True)
+    importlib.invalidate_caches()
 
 
 def print_status_report(resolved: dict[str, Any]) -> None:
